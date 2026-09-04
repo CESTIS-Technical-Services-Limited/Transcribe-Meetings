@@ -220,6 +220,28 @@ mark { background: rgba(245,166,35,.35); color: inherit; border-radius: 3px; pad
   #hamb { display: inline-flex; }
   .view { padding: 60px 16px 80px; }
 }
+
+/* ── Additions: recording sources, live captions, speakers, resume ── */
+.rec-opts { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 8px; }
+.rec-opts .field { flex: 1; min-width: 200px; }
+.rec-opts .chk { padding-bottom: 10px; }
+.live-cap { margin-top: 12px; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; max-height: 130px; overflow-y: auto; font-size: 13px; line-height: 1.55; text-align: left; }
+.live-status { color: var(--muted); font-family: var(--font-mono); font-size: 11.5px; }
+.live-text { color: var(--text); }
+.seg-body { flex: 1; min-width: 0; }
+.seg-wrap.with-spk .seg { border-left: 3px solid transparent; }
+.seg.has-spk { border-left-color: var(--spk); }
+.seg.spk-start { margin-top: 8px; }
+.seg-spk { border: none; background: transparent; color: var(--spk, var(--accent)); font-weight: 700; font-size: 11px; letter-spacing: .6px; text-transform: uppercase; cursor: pointer; padding: 2px 6px; margin: 1px 0 2px; border-radius: 6px; font-family: var(--font-mono); }
+.seg-spk:hover { background: var(--bg3); }
+.proc-warn { margin-top: 10px; font-size: 12px; color: var(--accent); line-height: 1.5; display: none; }
+.resume-box { background: var(--accent-dim); border: 1px solid rgba(245,166,35,.3); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; flex-wrap: wrap; }
+.player-extra { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.player-extra select { width: auto; padding: 4px 26px 4px 8px; font-size: 12px; margin-left: 6px; }
+.kbd-hint { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted2); }
+.ai-stream { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 12px; max-height: 260px; overflow-y: auto; font-family: var(--font-ui); font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; margin-top: 4px; }
+details.adv { margin-bottom: 16px; }
+details.adv summary { cursor: pointer; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; font-weight: 600; user-select: none; }
 </style>
 </head>
 <body>
@@ -252,6 +274,342 @@ mark { background: rgba(245,166,35,.35); color: inherit; border-radius: 3px; pad
 <input type="file" id="file-input" multiple hidden
   accept="audio/*,video/mp4,video/webm,video/quicktime,.mp3,.mp4,.m4a,.wav,.ogg,.oga,.opus,.webm,.flac,.aac,.mov,.wma">
 
+<script type="text/plain" id="engine-src">
+/* ═══════════════════════════════════════════════════════════════
+   VoiceScript engine — runs inside a Web Worker.
+   One worker instance acts as the Whisper transcriber (WebGPU or
+   WASM); a second instance acts as the speaker-diarization engine
+   (pyannote segmentation + WeSpeaker embeddings, CPU) so the two
+   run in parallel. The same source runs inline on the main thread
+   when workers are unavailable (some file:// setups).
+   ═══════════════════════════════════════════════════════════════ */
+'use strict';
+const SR = 16000;
+let mod = null, pipe = null, loadedKey = '', device = null, activeHost = '';
+
+async function loadTransformers(urls) {
+  if (mod) return mod;
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const m = await import(url);
+      const wasmCfg = m.env && m.env.backends && m.env.backends.onnx && m.env.backends.onnx.wasm;
+      if (wasmCfg && typeof wasmCfg.wasmPaths === 'string' && url.indexOf('unpkg.com') !== -1) {
+        wasmCfg.wasmPaths = wasmCfg.wasmPaths.replace('https://cdn.jsdelivr.net/npm/', 'https://unpkg.com/');
+      }
+      mod = m; return m;
+    } catch (err) { lastErr = err; }
+  }
+  throw new Error('Could not download the AI engine — your network appears to block cdn.jsdelivr.net and unpkg.com. Try a different network, then retry.' + (lastErr ? ' (' + (lastErr.message || lastErr) + ')' : ''));
+}
+function applyHost(m, host) {
+  host = (host || '').trim();
+  if (host && !/\/$/.test(host)) host += '/';
+  if (host === activeHost) return;
+  activeHost = host;
+  m.env.remoteHost = host || 'https://huggingface.co/';
+  m.env.remotePathTemplate = '{model}/resolve/{revision}/';
+}
+function progressRelay(tag) {
+  return function (p) {
+    if (p && p.status === 'progress') self.postMessage({ type: 'download', tag: tag, file: p.file || '', loaded: p.loaded || 0, total: p.total || 0 });
+  };
+}
+function friendlyLoadError(err, model) {
+  const m = (err && err.message) || String(err);
+  if (/404|Unauthorized|401|could not locate|Could not locate/i.test(m)) {
+    return new Error('The model "' + model + '" could not be found on the model host. Check the model ID (it must be an ONNX export, e.g. onnx-community/whisper-small) or choose another accuracy level. (' + m + ')');
+  }
+  return err;
+}
+
+/* ── Whisper ─────────────────────────────────────────────────── */
+async function loadWhisper(msg) {
+  const m = await loadTransformers(msg.cdnUrls);
+  applyHost(m, msg.host);
+  if (!device || msg.forceDevice) {
+    if (msg.forceDevice === 'wasm') device = 'wasm';
+    else {
+      try {
+        const nav = self.navigator || (typeof navigator !== 'undefined' ? navigator : null);
+        device = (nav && nav.gpu && await nav.gpu.requestAdapter()) ? 'webgpu' : 'wasm';
+      } catch (err) { device = 'wasm'; }
+    }
+  }
+  const wantKey = msg.model + '|' + device + '|' + activeHost;
+  if (loadedKey !== wantKey) {
+    if (pipe && pipe.dispose) { try { await pipe.dispose(); } catch (e) {} }
+    pipe = null; loadedKey = '';
+    const onProg = progressRelay('whisper');
+    try {
+      const opts = device === 'webgpu'
+        ? { device: 'webgpu', dtype: { encoder_model: 'fp16', decoder_model_merged: 'q4' } }
+        : { device: 'wasm', dtype: 'q8' };
+      pipe = await m.pipeline('automatic-speech-recognition', msg.model, Object.assign({}, opts, { progress_callback: onProg }));
+    } catch (err) {
+      if (device === 'webgpu' && !/404|could not locate/i.test((err && err.message) || '')) {
+        device = 'wasm';
+        try {
+          pipe = await m.pipeline('automatic-speech-recognition', msg.model, { device: 'wasm', dtype: 'q8', progress_callback: onProg });
+        } catch (err2) { throw friendlyLoadError(err2, msg.model); }
+      } else { throw friendlyLoadError(err, msg.model); }
+    }
+    loadedKey = msg.model + '|' + device + '|' + activeHost;
+  }
+  return device;
+}
+
+function isHallucinated(text) {
+  if (!text || text.length < 24) return false;
+  const words = text.trim().split(/\s+/);
+  if (words.length < 6) return false;
+  const grams = new Set(); let total = 0;
+  for (let i = 0; i < words.length - 2; i++) { grams.add(words[i] + ' ' + words[i + 1] + ' ' + words[i + 2]); total++; }
+  return total > 0 && (grams.size / total) < 0.3;
+}
+// Whisper's classic failure modes on silence/noise: fixed phrases it
+// was trained to emit for credits, subtitles and thanks.
+const BOILERPLATE = [
+  /^thanks? (you )?(so much )?for (watching|listening)/i,
+  /subtitles? (by|provided by|created by)/i, /amara\.org/i,
+  /^please (like and |remember to )?subscribe/i, /^(like|subscribe)( and (subscribe|like))?( to (my|the|our) channel)?[.!]*$/i,
+  /^www\.[a-z0-9-]+\./i, /^copyright ©?\s*\d{4}/i, /all rights reserved/i,
+  /^[\[(](music|applause|laughter|silence|blank_audio)[\])]$/i,
+  /^you[.!?]*$/i,
+];
+function isBoilerplate(t) {
+  const s = t.trim();
+  if (/^[\s\p{P}\p{S}]*$/u.test(s)) return true;
+  return BOILERPLATE.some(re => re.test(s));
+}
+
+async function transcribe(msg) {
+  if (!pipe) throw new Error('Model not loaded');
+  const opts = {
+    task: msg.task || 'transcribe',
+    chunk_length_s: 30,
+    stride_length_s: 5,
+    return_timestamps: true,
+    no_repeat_ngram_size: 5,
+  };
+  if (msg.language) opts.language = msg.language;
+  const result = await pipe(msg.audio, opts);
+  const raw = (result && result.chunks && result.chunks.length) ? result.chunks : [{ text: (result && result.text) || '', timestamp: [0, null] }];
+  const cues = []; let prev = '';
+  for (const c of raw) {
+    const t = (c.text || '').trim();
+    if (!t) continue;
+    if (isHallucinated(t) || isBoilerplate(t)) continue;
+    if (t === prev && t.length > 8) continue;
+    prev = t;
+    const ts = c.timestamp || [0, null];
+    const s = (typeof ts[0] === 'number' && isFinite(ts[0])) ? ts[0] : 0;
+    const en = (typeof ts[1] === 'number' && isFinite(ts[1])) ? ts[1] : s + 4;
+    cues.push({ start: msg.offset + s, end: msg.offset + Math.max(en, s + 0.2), text: t });
+  }
+  return cues;
+}
+
+/* ── Speaker diarization ─────────────────────────────────────── */
+const SEG_MODEL = 'onnx-community/pyannote-segmentation-3.0';
+const EMB_MODELS = ['onnx-community/wespeaker-voxceleb-resnet34-LM', 'Xenova/wespeaker-voxceleb-resnet34-LM'];
+// pyannote-segmentation-3.0 emits "powerset" classes: which of up to
+// three local speakers are active in a frame.
+const POWERSET = [[], [0], [1], [2], [0, 1], [0, 2], [1, 2]];
+const DIAR_WINDOW = 10 * SR;       // the model is trained on 10 s chunks
+const D = { proc: null, seg: null, embFE: null, emb: null, items: [], segs: [] };
+
+async function loadDiar(msg) {
+  const m = await loadTransformers(msg.cdnUrls);
+  applyHost(m, msg.host);
+  if (D.seg && D.emb) return;
+  const onProg = progressRelay('speakers');
+  D.proc = await m.AutoProcessor.from_pretrained(SEG_MODEL, { progress_callback: onProg });
+  D.seg = await m.AutoModelForAudioFrameClassification.from_pretrained(SEG_MODEL, { device: 'wasm', dtype: 'fp32', progress_callback: onProg });
+  let lastErr = null;
+  for (const id of EMB_MODELS) {
+    try {
+      D.embFE = await m.AutoFeatureExtractor.from_pretrained(id, { progress_callback: onProg });
+      D.emb = await m.AutoModel.from_pretrained(id, { device: 'wasm', dtype: 'fp32', progress_callback: onProg });
+      break;
+    } catch (err) { lastErr = err; D.embFE = null; D.emb = null; }
+  }
+  if (!D.emb) throw lastErr || new Error('Speaker embedding model unavailable');
+}
+function resetDiar() { D.items = []; D.segs = []; }
+
+function mergeIntervals(list, gap) {
+  const s = list.slice().sort((a, b) => a.start - b.start);
+  const out = [];
+  for (const iv of s) {
+    const last = out[out.length - 1];
+    if (last && iv.start - last.end <= gap) last.end = Math.max(last.end, iv.end);
+    else out.push({ start: iv.start, end: iv.end });
+  }
+  return out;
+}
+function l2norm(v) {
+  let s = 0; for (let i = 0; i < v.length; i++) s += v[i] * v[i];
+  s = Math.sqrt(s) || 1;
+  const out = new Float32Array(v.length);
+  for (let i = 0; i < v.length; i++) out[i] = v[i] / s;
+  return out;
+}
+function firstTensor(out) {
+  if (out && out.embeddings) return out.embeddings;
+  if (out && out.last_hidden_state) return out.last_hidden_state;
+  for (const k in out) if (out[k] && out[k].data) return out[k];
+  throw new Error('No embedding output');
+}
+
+async function diarizeWindow(msg) {
+  const audio = msg.audio, offset = msg.offset;
+  for (let s = 0; s < audio.length; s += DIAR_WINDOW) {
+    const piece = audio.subarray(s, Math.min(audio.length, s + DIAR_WINDOW));
+    if (piece.length < SR / 2) break;
+    const t0 = offset + s / SR;
+    const inputs = await D.proc(piece);
+    const { logits } = await D.seg(inputs);
+    const post = D.proc.post_process_speaker_diarization ? D.proc : D.proc.feature_extractor;
+    const raw = post.post_process_speaker_diarization(logits, piece.length)[0];
+    const act = [[], [], []];
+    for (const r of raw) {
+      const spk = POWERSET[r.id] || [];
+      if (!spk.length || r.end - r.start < 0.08) continue;
+      for (const k of spk) act[k].push({ start: r.start, end: r.end, clean: spk.length === 1 });
+    }
+    for (let k = 0; k < 3; k++) {
+      if (!act[k].length) continue;
+      const merged = mergeIntervals(act[k], 0.25);
+      let src = act[k].filter(a => a.clean);
+      let dur = src.reduce((a, b) => a + (b.end - b.start), 0);
+      if (dur < 0.6) { src = act[k]; dur = act[k].reduce((a, b) => a + (b.end - b.start), 0); }
+      let emb = null;
+      if (dur >= 0.4) {
+        try {
+          const parts = src.map(a => piece.subarray(Math.floor(a.start * SR), Math.min(piece.length, Math.ceil(a.end * SR))));
+          const total = parts.reduce((a, p) => a + p.length, 0);
+          const cat = new Float32Array(total); let o = 0;
+          for (const p of parts) { cat.set(p, o); o += p.length; }
+          const feats = await D.embFE(cat);
+          const out = await D.emb(feats);
+          emb = l2norm(firstTensor(out).data);
+        } catch (err) { emb = null; }
+      }
+      const item = D.items.length;
+      D.items.push({ time: t0, emb: emb, dur: dur });
+      for (const iv of merged) D.segs.push({ start: t0 + iv.start, end: t0 + iv.end, item: item });
+    }
+  }
+}
+
+// Weighted average-linkage agglomerative clustering on cosine distance.
+// Stops at the pyannote-tuned distance threshold, or keeps merging until
+// the requested maximum number of speakers is reached.
+function clusterItems(items, maxSpeakers) {
+  const idx = [];
+  for (let i = 0; i < items.length; i++) if (items[i].emb) idx.push(i);
+  const N = idx.length, label = new Int32Array(items.length).fill(-1);
+  if (!N) { label.fill(0); return { label: label, count: items.length ? 1 : 0 }; }
+  const THRESH = 0.7;
+  const dist = new Float32Array(N * N);
+  for (let a = 0; a < N; a++) {
+    const ea = items[idx[a]].emb;
+    for (let b = a + 1; b < N; b++) {
+      const eb = items[idx[b]].emb; let dot = 0;
+      for (let i = 0; i < ea.length; i++) dot += ea[i] * eb[i];
+      const d = 1 - dot; dist[a * N + b] = d; dist[b * N + a] = d;
+    }
+  }
+  const size = new Float64Array(N), active = new Uint8Array(N), root = new Int32Array(N);
+  const nn = new Int32Array(N), nnd = new Float32Array(N);
+  for (let a = 0; a < N; a++) { size[a] = Math.max(0.2, items[idx[a]].dur); active[a] = 1; root[a] = a; }
+  const recomputeNN = (a) => {
+    let bj = -1, bd = Infinity; const row = a * N;
+    for (let b = 0; b < N; b++) { if (b === a || !active[b]) continue; const d = dist[row + b]; if (d < bd) { bd = d; bj = b; } }
+    nn[a] = bj; nnd[a] = bd;
+  };
+  for (let a = 0; a < N; a++) recomputeNN(a);
+  let K = N;
+  while (K > 1) {
+    let bi = -1, bd = Infinity;
+    for (let a = 0; a < N; a++) if (active[a] && nnd[a] < bd) { bd = nnd[a]; bi = a; }
+    if (bi < 0 || nn[bi] < 0) break;
+    if (bd > THRESH && (!maxSpeakers || K <= maxSpeakers)) break;
+    const bj = nn[bi], wi = size[bi], wj = size[bj], w = wi + wj;
+    for (let k = 0; k < N; k++) {
+      if (!active[k] || k === bi || k === bj) continue;
+      const d = (dist[bi * N + k] * wi + dist[bj * N + k] * wj) / w;
+      dist[bi * N + k] = d; dist[k * N + bi] = d;
+    }
+    size[bi] = w; active[bj] = 0; K--;
+    for (let k = 0; k < N; k++) if (root[k] === bj) root[k] = bi;
+    recomputeNN(bi);
+    for (let k = 0; k < N; k++) {
+      if (!active[k] || k === bi) continue;
+      if (nn[k] === bi || nn[k] === bj) recomputeNN(k);
+      else if (dist[bi * N + k] < nnd[k]) { nn[k] = bi; nnd[k] = dist[bi * N + k]; }
+    }
+  }
+  // number clusters by first appearance in time
+  const order = new Map();
+  const byTime = idx.map((it, a) => ({ a: a, t: items[it].time })).sort((x, y) => x.t - y.t);
+  for (const { a } of byTime) { const r = root[a]; if (!order.has(r)) order.set(r, order.size); }
+  for (let a = 0; a < N; a++) label[idx[a]] = order.get(root[a]);
+  // items too short for an embedding follow the nearest labelled item in time
+  for (let i = 0; i < items.length; i++) {
+    if (label[i] >= 0) continue;
+    let best = -1, bd = Infinity;
+    for (const it of idx) { const d = Math.abs(items[it].time - items[i].time); if (d < bd) { bd = d; best = it; } }
+    label[i] = best >= 0 ? label[best] : 0;
+  }
+  return { label: label, count: order.size || 1 };
+}
+
+function finalizeSpeakers(msg) {
+  const { label, count } = clusterItems(D.items, msg.maxSpeakers || 0);
+  const turns = D.segs.map(s => ({ start: s.start, end: s.end, spk: label[s.item] })).sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const t of turns) {
+    const last = merged[merged.length - 1];
+    if (last && last.spk === t.spk && t.start - last.end <= 0.4) last.end = Math.max(last.end, t.end);
+    else merged.push({ start: t.start, end: t.end, spk: t.spk });
+  }
+  return { turns: merged, count: count };
+}
+
+/* ── Message loop ────────────────────────────────────────────── */
+self.onmessage = async function (e) {
+  const msg = e.data;
+  try {
+    if (msg.type === 'load') {
+      const dev = await loadWhisper(msg);
+      self.postMessage({ type: 'loaded', id: msg.id, device: dev });
+    } else if (msg.type === 'transcribe') {
+      const cues = await transcribe(msg);
+      self.postMessage({ type: 'result', id: msg.id, cues: cues });
+    } else if (msg.type === 'loadDiar') {
+      await loadDiar(msg);
+      self.postMessage({ type: 'loaded', id: msg.id, device: 'wasm' });
+    } else if (msg.type === 'resetDiar') {
+      resetDiar();
+      self.postMessage({ type: 'result', id: msg.id });
+    } else if (msg.type === 'diarize') {
+      await diarizeWindow(msg);
+      self.postMessage({ type: 'result', id: msg.id, items: D.items.length });
+    } else if (msg.type === 'speakers') {
+      const out = finalizeSpeakers(msg);
+      self.postMessage({ type: 'result', id: msg.id, turns: out.turns, count: out.count });
+    } else if (msg.type === 'ping') {
+      self.postMessage({ type: 'result', id: msg.id });
+    }
+  } catch (err) {
+    self.postMessage({ type: 'error', id: msg && msg.id, message: (err && err.message) || String(err) });
+  }
+};
+self.__internals = { clusterItems, finalizeSpeakers, D, isHallucinated, isBoilerplate, mp3: null };
+self.postMessage({ type: 'boot' });
+</script>
 <script>
 'use strict';
 
@@ -285,6 +643,12 @@ function fmtClock(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
   return (h ? String(h).padStart(2,'0') + ':' : '') + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
 }
+function fmtEta(sec) {
+  if (!isFinite(sec) || sec < 0) return '';
+  if (sec < 60) return 'under a minute';
+  if (sec < 3600) return 'about ' + Math.round(sec / 60) + ' min';
+  return 'about ' + (Math.round(sec / 360) / 10) + ' h';
+}
 function tsStamp(sec, msSep) {
   sec = Math.max(0, sec || 0);
   const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = Math.floor(sec%60);
@@ -316,6 +680,7 @@ function download(blob, filename) {
 function safeName(s) {
   return (s || 'transcript').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 80) || 'transcript';
 }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 let toastTimer = null;
 function toast(icon, msg) {
   $('#toast-ic').textContent = icon;
@@ -362,11 +727,17 @@ const dbAll = (store) => dbTx(store, 'readonly', os => os.getAll());
 /* ════════════════════════════════════════════════════════════════
    App state
    ════════════════════════════════════════════════════════════════ */
+const DEFAULT_SETTINGS = {
+  quality: 'small', language: 'auto', task: 'transcribe', apiKey: '',
+  speakers: true, maxSpeakers: 0,          // diarization on/off, 0 = detect the number of speakers
+  customModel: '', modelHost: '',          // advanced: any ONNX Whisper repo id / model mirror
+  exportTs: false, liveCaptions: true, recSource: 'mic',
+};
 const state = {
   transcripts: [],           // full records, newest first
   route: { view: 'home', id: null },
   libFilter: '',
-  settings: { quality: 'small', language: 'auto', task: 'transcribe', apiKey: '' },
+  settings: Object.assign({}, DEFAULT_SETTINGS),
   job: null,                 // active transcription job
   queue: [],                 // pending {blob, name}
   player: { url: null, forId: null },
@@ -374,121 +745,51 @@ const state = {
   tvSearch: '',
   follow: true,
   gpu: null,                 // 'webgpu' | 'wasm' | null (unknown yet)
+  wakeLock: null,
 };
 
 const MODELS = {
-  tiny:  { id: 'onnx-community/whisper-tiny',           label: 'Fastest — Tiny (~50 MB)' },
-  base:  { id: 'onnx-community/whisper-base',           label: 'Fast — Base (~80 MB)' },
-  small: { id: 'onnx-community/whisper-small',          label: 'Balanced — Small (~250 MB)' },
-  turbo: { id: 'onnx-community/whisper-large-v3-turbo', label: 'Maximum — Large-v3 Turbo (~600 MB)' },
+  tiny:  { id: 'onnx-community/whisper-tiny',           label: 'Fastest — Tiny (~50 MB)',            size: '~50 MB' },
+  base:  { id: 'onnx-community/whisper-base',           label: 'Fast — Base (~80 MB)',               size: '~80 MB' },
+  small: { id: 'onnx-community/whisper-small',          label: 'Balanced — Small (~250 MB)',         size: '~250 MB' },
+  turbo: { id: 'onnx-community/whisper-large-v3-turbo', label: 'Maximum — Large-v3 Turbo (~600 MB)', size: '~600 MB' },
+  large: { id: 'onnx-community/whisper-large-v3',       label: 'Ultimate — Large-v3 (~1.6 GB, GPU only)', size: '~1.6 GB' },
+  custom:{ id: '',                                      label: 'Custom model (Settings → Advanced)', size: '' },
 };
-const LANGS = [
-  ['auto','Auto-detect'],['en','English'],['es','Spanish'],['fr','French'],['de','German'],
-  ['it','Italian'],['pt','Portuguese'],['nl','Dutch'],['pl','Polish'],['ru','Russian'],
-  ['uk','Ukrainian'],['tr','Turkish'],['ar','Arabic'],['he','Hebrew'],['hi','Hindi'],
-  ['ur','Urdu'],['fa','Persian'],['zh','Chinese'],['ja','Japanese'],['ko','Korean'],
-  ['vi','Vietnamese'],['th','Thai'],['id','Indonesian'],['ms','Malay'],['sv','Swedish'],
-  ['no','Norwegian'],['da','Danish'],['fi','Finnish'],['cs','Czech'],['el','Greek'],
-  ['ro','Romanian'],['hu','Hungarian'],['bg','Bulgarian'],['sw','Swahili'],['ta','Tamil'],
-];
+function activeModelId(quality) {
+  if (quality === 'custom') return (state.settings.customModel || '').trim() || MODELS.small.id;
+  return (MODELS[quality] || MODELS.small).id;
+}
+const LANGS = [['auto','Auto-detect']].concat([
+  ['af','Afrikaans'],['sq','Albanian'],['am','Amharic'],['ar','Arabic'],['hy','Armenian'],['as','Assamese'],
+  ['az','Azerbaijani'],['ba','Bashkir'],['eu','Basque'],['be','Belarusian'],['bn','Bengali'],['bs','Bosnian'],
+  ['br','Breton'],['bg','Bulgarian'],['yue','Cantonese'],['ca','Catalan'],['zh','Chinese'],['hr','Croatian'],
+  ['cs','Czech'],['da','Danish'],['nl','Dutch'],['en','English'],['et','Estonian'],['fo','Faroese'],['fi','Finnish'],
+  ['fr','French'],['gl','Galician'],['ka','Georgian'],['de','German'],['el','Greek'],['gu','Gujarati'],
+  ['ht','Haitian Creole'],['ha','Hausa'],['haw','Hawaiian'],['he','Hebrew'],['hi','Hindi'],['hu','Hungarian'],
+  ['is','Icelandic'],['id','Indonesian'],['it','Italian'],['ja','Japanese'],['jw','Javanese'],['kn','Kannada'],
+  ['kk','Kazakh'],['km','Khmer'],['ko','Korean'],['lo','Lao'],['la','Latin'],['lv','Latvian'],['ln','Lingala'],
+  ['lt','Lithuanian'],['lb','Luxembourgish'],['mk','Macedonian'],['mg','Malagasy'],['ms','Malay'],['ml','Malayalam'],
+  ['mt','Maltese'],['mi','Maori'],['mr','Marathi'],['mn','Mongolian'],['my','Myanmar'],['ne','Nepali'],
+  ['no','Norwegian'],['nn','Norwegian Nynorsk'],['oc','Occitan'],['ps','Pashto'],['fa','Persian'],['pl','Polish'],
+  ['pt','Portuguese'],['pa','Punjabi'],['ro','Romanian'],['ru','Russian'],['sa','Sanskrit'],['sr','Serbian'],
+  ['sn','Shona'],['sd','Sindhi'],['si','Sinhala'],['sk','Slovak'],['sl','Slovenian'],['so','Somali'],['es','Spanish'],
+  ['su','Sundanese'],['sw','Swahili'],['sv','Swedish'],['tl','Tagalog'],['tg','Tajik'],['ta','Tamil'],['tt','Tatar'],
+  ['te','Telugu'],['th','Thai'],['bo','Tibetan'],['tr','Turkish'],['tk','Turkmen'],['uk','Ukrainian'],['ur','Urdu'],
+  ['uz','Uzbek'],['vi','Vietnamese'],['cy','Welsh'],['yi','Yiddish'],['yo','Yoruba'],
+]);
 const CDN_SOURCES = [
   'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3',
   'https://unpkg.com/@huggingface/transformers@3.3.3/dist/transformers.min.js',
 ];
+const SPEAKER_COLORS = ['#f5a623', '#60a5fa', '#4ade80', '#a78bfa', '#f87171', '#34d399', '#fb923c', '#e879f9', '#22d3ee', '#facc15'];
 
 /* ════════════════════════════════════════════════════════════════
-   Transcription engine — Whisper in a Web Worker (WebGPU/WASM)
-   The same source runs inline on the main thread if workers are
-   unavailable (e.g. some file:// setups).
+   Engines — the worker source lives in <script id="engine-src">.
+   `engine` runs Whisper; `speakerEngine` runs diarization models in
+   a second worker so both progress in parallel.
    ════════════════════════════════════════════════════════════════ */
-const ENGINE_SOURCE = [
-"let mod = null, pipe = null, loadedKey = '', device = null;",
-"async function loadTransformers(urls) {",
-"  if (mod) return mod;",
-"  let lastErr = null;",
-"  for (const url of urls) {",
-"    try {",
-"      const m = await import(url);",
-"      const wasmCfg = m.env && m.env.backends && m.env.backends.onnx && m.env.backends.onnx.wasm;",
-"      if (wasmCfg && typeof wasmCfg.wasmPaths === 'string' && url.indexOf('unpkg.com') !== -1) {",
-"        wasmCfg.wasmPaths = wasmCfg.wasmPaths.replace('https://cdn.jsdelivr.net/npm/', 'https://unpkg.com/');",
-"      }",
-"      mod = m; return m;",
-"    } catch (err) { lastErr = err; }",
-"  }",
-"  throw new Error('Could not download the AI engine — your network appears to block cdn.jsdelivr.net and unpkg.com. Try a different network, then retry.' + (lastErr ? ' (' + (lastErr.message || lastErr) + ')' : ''));",
-"}",
-"function isHallucinated(text) {",
-"  if (!text || text.length < 24) return false;",
-"  const words = text.trim().split(/\\s+/);",
-"  if (words.length < 6) return false;",
-"  const grams = new Set(); let total = 0;",
-"  for (let i = 0; i < words.length - 2; i++) { grams.add(words[i] + ' ' + words[i+1] + ' ' + words[i+2]); total++; }",
-"  return total > 0 && (grams.size / total) < 0.3;",
-"}",
-"self.onmessage = async function(e) {",
-"  const msg = e.data;",
-"  try {",
-"    if (msg.type === 'load') {",
-"      const m = await loadTransformers(msg.cdnUrls);",
-"      if (!device) {",
-"        try {",
-"          const nav = self.navigator || (typeof navigator !== 'undefined' ? navigator : null);",
-"          device = (nav && nav.gpu && await nav.gpu.requestAdapter()) ? 'webgpu' : 'wasm';",
-"        } catch (err) { device = 'wasm'; }",
-"      }",
-"      const wantKey = msg.model + '|' + device;",
-"      if (loadedKey !== wantKey) {",
-"        pipe = null; loadedKey = '';",
-"        const onProg = function(p) {",
-"          if (p && p.status === 'progress') self.postMessage({ type: 'download', file: p.file || '', loaded: p.loaded || 0, total: p.total || 0 });",
-"        };",
-"        try {",
-"          const opts = device === 'webgpu'",
-"            ? { device: 'webgpu', dtype: { encoder_model: 'fp16', decoder_model_merged: 'q4' } }",
-"            : { device: 'wasm', dtype: 'q8' };",
-"          pipe = await m.pipeline('automatic-speech-recognition', msg.model, Object.assign({}, opts, { progress_callback: onProg }));",
-"        } catch (err) {",
-"          if (device === 'webgpu') {",
-"            device = 'wasm';",
-"            pipe = await m.pipeline('automatic-speech-recognition', msg.model, { device: 'wasm', dtype: 'q8', progress_callback: onProg });",
-"          } else { throw err; }",
-"        }",
-"        loadedKey = msg.model + '|' + device;",
-"      }",
-"      self.postMessage({ type: 'loaded', device: device });",
-"    } else if (msg.type === 'transcribe') {",
-"      if (!pipe) throw new Error('Model not loaded');",
-"      const opts = {",
-"        task: msg.task || 'transcribe',",
-"        chunk_length_s: 30,",
-"        stride_length_s: 5,",
-"        return_timestamps: true,",
-"        generate_kwargs: { no_repeat_ngram_size: 3 },",
-"      };",
-"      if (msg.language) opts.language = msg.language;",
-"      const result = await pipe(msg.audio, opts);",
-"      const raw = (result && result.chunks && result.chunks.length) ? result.chunks : [{ text: (result && result.text) || '', timestamp: [0, null] }];",
-"      const cues = []; let prev = '';",
-"      for (const c of raw) {",
-"        const t = (c.text || '').trim();",
-"        if (!t) continue;",
-"        if (isHallucinated(t)) continue;",
-"        if (t === prev && t.length > 8) continue;",
-"        prev = t;",
-"        const ts = c.timestamp || [0, null];",
-"        const s = (typeof ts[0] === 'number' && isFinite(ts[0])) ? ts[0] : 0;",
-"        const en = (typeof ts[1] === 'number' && isFinite(ts[1])) ? ts[1] : s + 4;",
-"        cues.push({ start: msg.offset + s, end: msg.offset + Math.max(en, s + 0.2), text: t });",
-"      }",
-"      self.postMessage({ type: 'result', id: msg.id, cues: cues });",
-"    }",
-"  } catch (err) {",
-"    self.postMessage({ type: 'error', id: msg && msg.id, message: (err && err.message) || String(err) });",
-"  }",
-"};",
-"self.postMessage({ type: 'boot' });",
-].join('\n');
+const ENGINE_SOURCE = document.getElementById('engine-src').textContent;
 
 function createInlineEngine() {
   const host = {
@@ -507,36 +808,32 @@ function createInlineEngine() {
 }
 
 class Engine {
-  constructor() {
+  constructor(role) {
+    this.role = role;
     this.worker = null;
     this.device = null;
-    this.loadedModel = null;
-    this.op = null;            // { resolve, reject } for the in-flight request
+    this.loadedKey = null;
+    this.pending = new Map();
     this.onDownload = null;
   }
   _spawn() {
     return new Promise((resolve) => {
-      let w = null, real = false;
+      let w = null, real = false, booted = false;
       try {
         const url = URL.createObjectURL(new Blob([ENGINE_SOURCE], { type: 'text/javascript' }));
         w = new Worker(url);
         real = true;
       } catch (e) { w = createInlineEngine(); }
-      let booted = false;
       const wire = (worker) => {
         worker.onmessage = (e) => this._dispatch(e.data);
-        if (worker.addEventListener) {
-          worker.onerror = () => { if (!booted) { fallback(); } };
-        }
+        worker.onerror = (e) => { if (!booted) fallback(); else this._failAll(new Error('The engine crashed' + (e && e.message ? ': ' + e.message : '') + '. Retry with a smaller model.')); };
       };
       const fallback = () => {
         if (booted) return;
         booted = true;
         try { if (real && w.terminate) w.terminate(); } catch (e) {}
-        w = createInlineEngine();
-        real = false;
+        w = createInlineEngine(); real = false;
         this.worker = w;
-        const orig = w.onmessage;
         w.onmessage = (e) => {
           if (e.data && e.data.type === 'boot') { wire(w); resolve(); return; }
           this._dispatch(e.data);
@@ -547,119 +844,402 @@ class Engine {
         if (e.data && e.data.type === 'boot') { booted = true; wire(w); resolve(); return; }
         this._dispatch(e.data);
       };
-      if (real) setTimeout(() => { if (!booted) { fallback(); } }, 4000);
+      if (real) setTimeout(() => { if (!booted) fallback(); }, 4000);
     });
   }
   _dispatch(msg) {
     if (!msg) return;
     if (msg.type === 'download') { if (this.onDownload) this.onDownload(msg); return; }
-    const op = this.op;
+    const op = msg.id != null ? this.pending.get(msg.id) : null;
     if (!op) return;
-    if (msg.type === 'loaded') { this.op = null; this.device = msg.device; op.resolve(msg); }
-    else if (msg.type === 'result') { this.op = null; op.resolve(msg); }
-    else if (msg.type === 'error') { this.op = null; op.reject(new Error(msg.message || 'Engine error')); }
+    this.pending.delete(msg.id);
+    if (msg.type === 'error') op.reject(new Error(msg.message || 'Engine error'));
+    else op.resolve(msg);
   }
-  _request(msg, transfer) {
+  _failAll(err) {
+    for (const op of this.pending.values()) op.reject(err);
+    this.pending.clear();
+  }
+  async _request(msg, transfer) {
+    if (!this.worker) await this._spawn();
+    msg.id = uid();
     return new Promise((resolve, reject) => {
-      this.op = { resolve, reject };
+      this.pending.set(msg.id, { resolve, reject });
       try { this.worker.postMessage(msg, transfer || []); }
-      catch (e) { this.worker.postMessage(msg); }
+      catch (e) { try { this.worker.postMessage(msg); } catch (e2) { this.pending.delete(msg.id); reject(e2); } }
     });
   }
+  get busy() { return this.pending.size > 0; }
   async ensureLoaded(modelId, onDownload) {
-    if (!this.worker) await this._spawn();
     this.onDownload = onDownload || null;
-    if (this.loadedModel === modelId && this.device) return this.device;
-    const res = await this._request({ type: 'load', model: modelId, cdnUrls: CDN_SOURCES });
-    this.loadedModel = modelId;
+    const host = (state.settings.modelHost || '').trim();
+    const key = 'whisper|' + modelId + '|' + host;
+    if (this.loadedKey === key && this.device) { this.onDownload = null; return this.device; }
+    const res = await this._request({ type: 'load', model: modelId, cdnUrls: CDN_SOURCES, host });
+    this.loadedKey = key;
+    this.device = res.device;
     this.onDownload = null;
     return res.device;
   }
+  async ensureSpeakersLoaded(onDownload) {
+    this.onDownload = onDownload || null;
+    const host = (state.settings.modelHost || '').trim();
+    const key = 'speakers|' + host;
+    if (this.loadedKey === key) { this.onDownload = null; return; }
+    await this._request({ type: 'loadDiar', cdnUrls: CDN_SOURCES, host });
+    this.loadedKey = key;
+    this.onDownload = null;
+  }
   async transcribe(audio, offsetSec, language, task) {
-    const msg = { type: 'transcribe', id: uid(), audio, offset: offsetSec, language: language || null, task: task || 'transcribe' };
-    const res = await this._request(msg, [audio.buffer]);
+    const res = await this._request({ type: 'transcribe', audio, offset: offsetSec, language: language || null, task: task || 'transcribe' }, [audio.buffer]);
     return res.cues;
   }
+  diarize(audio, offsetSec) { return this._request({ type: 'diarize', audio, offset: offsetSec }, [audio.buffer]); }
+  resetSpeakers() { return this._request({ type: 'resetDiar' }); }
+  async speakers(maxSpeakers) { const r = await this._request({ type: 'speakers', maxSpeakers: maxSpeakers || 0 }); return { turns: r.turns || [], count: r.count || 0 }; }
   reset() {
     try { if (this.worker && this.worker.terminate) this.worker.terminate(); } catch (e) {}
-    if (this.op) { this.op.reject(new Error('cancelled')); this.op = null; }
+    this._failAll(new Error('cancelled'));
     this.worker = null;
-    this.loadedModel = null;
+    this.loadedKey = null;
     this.device = null;
   }
 }
-const engine = new Engine();
+const engine = new Engine('whisper');
+const speakerEngine = new Engine('speakers');
 
 /* ════════════════════════════════════════════════════════════════
-   Audio decoding & segmentation
+   Audio sources — audio is decoded in windows (streamed) so that
+   multi-hour recordings never sit in memory at once. WAV and MP3
+   are read straight from the file by byte range; every other format
+   is decoded once by the browser and kept as compact 16-bit PCM.
    ════════════════════════════════════════════════════════════════ */
 const SR = 16000;
+const WINDOW_TARGET = 120, WINDOW_MAX = 175;   // seconds per Whisper pass, cut at the quietest moment
 
-async function decodeToMono16k(blob) {
-  const buf = await blob.arrayBuffer();
-  const AC = window.AudioContext || window.webkitAudioContext;
-  let ctx;
-  try { ctx = new AC({ sampleRate: SR }); } catch (e) { ctx = new AC(); }
-  let decoded;
-  try {
-    decoded = await ctx.decodeAudioData(buf);
-  } catch (err) {
-    ctx.close();
-    throw new Error('This file could not be decoded as audio. Supported: MP3, MP4/M4A, WAV, OGG/Opus, WebM, FLAC, AAC. (' + ((err && err.message) || 'decode failed') + ')');
-  }
-  ctx.close();
-  const len = Math.max(1, Math.ceil(decoded.duration * SR));
-  let data;
-  try {
-    const off = new OfflineAudioContext(1, len, SR);
-    const src = off.createBufferSource();
-    src.buffer = decoded;
-    const hp = off.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 80;
-    src.connect(hp); hp.connect(off.destination); src.start();
-    data = (await off.startRendering()).getChannelData(0);
-  } catch (e) {
-    data = decoded.getChannelData(0);
-  }
-  let peak = 0;
-  for (let i = 0; i < data.length; i += 2) { const a = Math.abs(data[i]); if (a > peak) peak = a; }
-  if (peak > 0.001 && peak < 0.9) {
-    const g = Math.min(0.9 / peak, 25);
-    for (let i = 0; i < data.length; i++) data[i] *= g;
-  }
-  return data;
-}
-
-// Split long audio into ~2-minute segments, cutting at the quietest
-// point so words are not chopped mid-sentence.
-function planSegments(audio) {
-  const TARGET = 120 * SR, MAX = 175 * SR;
-  const frame = Math.round(0.12 * SR);
-  const segs = [];
-  let pos = 0;
-  while (pos < audio.length) {
-    let end;
-    if (audio.length - pos <= MAX) {
-      end = audio.length;
-    } else {
-      let best = pos + TARGET, bestE = Infinity;
-      for (let i = pos + TARGET; i + frame <= pos + MAX; i += frame) {
-        let e = 0;
-        for (let j = i; j < i + frame; j += 16) { const v = audio[j]; e += v * v; }
-        if (e < bestE) { bestE = e; best = i; }
+/* --- DSP --- */
+const _rsTables = new Map();
+function resampleTo16k(x, srcRate) {
+  if (srcRate === SR) return x;
+  const r = srcRate / SR, HW = Math.ceil(12 * Math.max(1, r)), taps = 2 * HW, P = 512;
+  let table = _rsTables.get(srcRate);
+  if (!table) {
+    table = new Float32Array(P * taps);
+    const fcut = 0.9 * Math.min(1, 1 / r);          // band-limit to the output Nyquist when downsampling
+    for (let p = 0; p < P; p++) {
+      const frac = p / P; let wsum = 0;
+      for (let j = 0; j < taps; j++) {
+        const d = (j - HW + 1) - frac;
+        const wn = 0.5 + 0.5 * Math.cos(Math.PI * d / HW);
+        const s = d === 0 ? fcut : Math.sin(Math.PI * fcut * d) / (Math.PI * d);
+        table[p * taps + j] = s * wn; wsum += s * wn;
       }
-      end = best;
+      for (let j = 0; j < taps; j++) table[p * taps + j] /= wsum;
     }
-    segs.push({ start: pos, end });
-    pos = end;
+    _rsTables.set(srcRate, table);
   }
-  return segs;
+  const outLen = Math.max(0, Math.floor(x.length / r));
+  const out = new Float32Array(outLen), n = x.length;
+  for (let i = 0; i < outLen; i++) {
+    const t = i * r, k0 = Math.floor(t);
+    const base = Math.min(P - 1, Math.floor((t - k0) * P)) * taps;
+    const kStart = k0 - HW + 1;
+    let acc = 0;
+    if (kStart >= 0 && kStart + taps <= n) {
+      for (let j = 0; j < taps; j++) acc += x[kStart + j] * table[base + j];
+    } else {
+      for (let j = 0; j < taps; j++) { const k = kStart + j; if (k >= 0 && k < n) acc += x[k] * table[base + j]; }
+    }
+    out[i] = acc;
+  }
+  return out;
 }
-function isSilentSlice(audio, from, to) {
-  let sum = 0, n = 0;
-  for (let i = from; i < to; i += 4) { const v = audio[i]; sum += v * v; n++; }
-  return n === 0 || Math.sqrt(sum / n) < 0.006;
+function highpassInPlace(x, sr, fc) {
+  const w0 = 2 * Math.PI * fc / sr, cosw = Math.cos(w0), sinw = Math.sin(w0), alpha = sinw / (2 * 0.7071);
+  const a0 = 1 + alpha;
+  const b0 = ((1 + cosw) / 2) / a0, b1 = (-(1 + cosw)) / a0, b2 = ((1 + cosw) / 2) / a0, a1 = (-2 * cosw) / a0, a2 = (1 - alpha) / a0;
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const xi = x[i], y = b0 * xi + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1; x1 = xi; y2 = y1; y1 = y; x[i] = y;
+  }
+}
+function rmsOf(x) {
+  let s = 0; for (let i = 0; i < x.length; i += 2) s += x[i] * x[i];
+  return Math.sqrt(s / Math.max(1, Math.ceil(x.length / 2)));
+}
+// High-pass (rumble/hum) + gentle level normalisation, in place.
+function conditionWindow(x) {
+  if (!x.length) return x;
+  highpassInPlace(x, SR, 80);
+  let peak = 0, sum = 0;
+  for (let i = 0; i < x.length; i++) { const v = x[i], a = v < 0 ? -v : v; if (a > peak) peak = a; sum += v * v; }
+  const rms = Math.sqrt(sum / x.length);
+  let g = 1;
+  if (peak > 0.95) g = 0.95 / peak;
+  else if (rms > 0.0025 && peak > 0.001 && peak < 0.5) g = Math.min(0.9 / peak, 12);
+  if (g !== 1) for (let i = 0; i < x.length; i++) x[i] *= g;
+  return x;
+}
+function isSilent(x) { return rmsOf(x) < 0.004; }
+// Index of the quietest 120 ms frame in [from, to) — used to cut windows between words.
+function quietestCut(x, from, to) {
+  const frame = Math.round(0.12 * SR);
+  let best = from, bestE = Infinity;
+  for (let i = from; i + frame <= to; i += frame) {
+    let e = 0; for (let j = i; j < i + frame; j += 8) e += x[j] * x[j];
+    if (e < bestE) { bestE = e; best = i; }
+  }
+  return Math.min(to, best + (frame >> 1));
+}
+function fitLength(x, skip, n) {
+  const out = new Float32Array(n);
+  if (skip < x.length) out.set(x.subarray(skip, Math.min(x.length, skip + n)));
+  return out;
+}
+function readBytes(blob, start, end) { return blob.slice(Math.max(0, start), Math.min(end, blob.size)).arrayBuffer(); }
+function fourcc(dv, o) { return String.fromCharCode(dv.getUint8(o), dv.getUint8(o + 1), dv.getUint8(o + 2), dv.getUint8(o + 3)); }
+
+let _decodeCtx = null;
+function getDecodeCtx() {
+  if (_decodeCtx) return _decodeCtx;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  try { _decodeCtx = new AC({ sampleRate: SR }); } catch (e) { _decodeCtx = new AC(); }
+  return _decodeCtx;
+}
+async function browserDecode(arrayBuffer) {
+  const ctx = getDecodeCtx();
+  return new Promise((res, rej) => {
+    const p = ctx.decodeAudioData(arrayBuffer, res, rej);
+    if (p && p.then) p.then(res, rej);
+  });
+}
+function audioBufferToMono16k(ab) {
+  const ch = ab.numberOfChannels, n = ab.length;
+  const chans = []; for (let c = 0; c < ch; c++) chans.push(ab.getChannelData(c));
+  let mono;
+  if (ch === 1) mono = chans[0];
+  else { mono = new Float32Array(n); for (let i = 0; i < n; i++) { let s = 0; for (let c = 0; c < ch; c++) s += chans[c][i]; mono[i] = s / ch; } }
+  return ab.sampleRate === SR ? mono : resampleTo16k(mono, ab.sampleRate);
+}
+
+/* --- WAV: parsed directly, any length (RIFF and RF64) --- */
+function pcmToMono(buf, fmt, frames) {
+  const ch = fmt.channels, bps = fmt.bits / 8, out = new Float32Array(frames);
+  if (fmt.format === 1 && bps === 2) {
+    const v = new Int16Array(buf, 0, frames * ch), k = 32768 * ch;
+    for (let i = 0, p = 0; i < frames; i++) { let s = 0; for (let c = 0; c < ch; c++) s += v[p++]; out[i] = s / k; }
+    return out;
+  }
+  if (fmt.format === 3 && bps === 4) {
+    const v = new Float32Array(buf, 0, frames * ch);
+    for (let i = 0, p = 0; i < frames; i++) { let s = 0; for (let c = 0; c < ch; c++) s += v[p++]; out[i] = s / ch; }
+    return out;
+  }
+  const dv = new DataView(buf);
+  for (let i = 0; i < frames; i++) {
+    let s = 0;
+    for (let c = 0; c < ch; c++) {
+      const o = (i * ch + c) * bps; let v;
+      if (fmt.format === 3) v = dv.getFloat64(o, true);
+      else if (bps === 1) v = (dv.getUint8(o) - 128) / 128;
+      else if (bps === 3) v = (dv.getUint8(o) | (dv.getUint8(o + 1) << 8) | (dv.getInt8(o + 2) << 16)) / 8388608;
+      else v = dv.getInt32(o, true) / 2147483648;
+      s += v;
+    }
+    out[i] = s / ch;
+  }
+  return out;
+}
+async function openWav(blob) {
+  const head = new DataView(await readBytes(blob, 0, 12));
+  if (head.byteLength < 12) return null;
+  const riff = fourcc(head, 0);
+  if ((riff !== 'RIFF' && riff !== 'RF64') || fourcc(head, 8) !== 'WAVE') return null;
+  let pos = 12, fmt = null, ds64 = null, dataOff = -1, dataLen = 0;
+  for (let guard = 0; guard < 64 && pos + 8 <= blob.size; guard++) {
+    const h = new DataView(await readBytes(blob, pos, pos + 8));
+    if (h.byteLength < 8) break;
+    const id = fourcc(h, 0), size = h.getUint32(4, true), body = pos + 8;
+    if (id === 'ds64') {
+      const d = new DataView(await readBytes(blob, body, body + 16));
+      if (d.byteLength >= 16) ds64 = { dataSize: d.getUint32(8, true) + d.getUint32(12, true) * 4294967296 };
+    } else if (id === 'fmt ') {
+      const f = new DataView(await readBytes(blob, body, body + Math.min(size, 40)));
+      if (f.byteLength < 16) return null;
+      fmt = { format: f.getUint16(0, true), channels: f.getUint16(2, true), rate: f.getUint32(4, true), blockAlign: f.getUint16(12, true), bits: f.getUint16(14, true) };
+      if (fmt.format === 0xFFFE && f.byteLength >= 26) fmt.format = f.getUint16(24, true);
+    } else if (id === 'data') {
+      dataOff = body;
+      dataLen = ((size === 0xFFFFFFFF || size === 0) && ds64) ? ds64.dataSize : size;
+      break;
+    }
+    pos = body + size + (size & 1);
+  }
+  if (!fmt || dataOff < 0) return null;
+  const bps = fmt.bits / 8;
+  const ok = (fmt.format === 1 && (bps === 1 || bps === 2 || bps === 3 || bps === 4)) || (fmt.format === 3 && (bps === 4 || bps === 8));
+  if (!ok || fmt.channels < 1 || fmt.channels > 32 || fmt.rate < 4000 || fmt.rate > 400000) return null;
+  const frameBytes = fmt.channels * bps;
+  if (dataLen <= 0 || dataOff + dataLen > blob.size) dataLen = blob.size - dataOff;   // recorders that never patched the header
+  const frames = Math.floor(dataLen / frameBytes);
+  if (frames < 1) return null;
+  const HW = Math.ceil(12 * Math.max(1, fmt.rate / SR)) + 2;
+  return {
+    kind: 'wav', durationSec: frames / fmt.rate, srcRate: fmt.rate, channels: fmt.channels,
+    async read(startSec, endSec) {
+      const s0 = Math.max(0, Math.round(startSec * fmt.rate)), s1 = Math.min(frames, Math.round(endSec * fmt.rate));
+      const outLen = Math.max(0, Math.round((endSec - startSec) * SR));
+      if (s1 <= s0) return new Float32Array(outLen);
+      const p0 = Math.max(0, s0 - HW), p1 = Math.min(frames, s1 + HW);
+      const buf = await readBytes(blob, dataOff + p0 * frameBytes, dataOff + p1 * frameBytes);
+      const mono = pcmToMono(buf, fmt, Math.floor(buf.byteLength / frameBytes));
+      const res = resampleTo16k(mono, fmt.rate);
+      return fitLength(res, Math.round((s0 - p0) * SR / fmt.rate), outLen);
+    },
+    close() {},
+  };
+}
+
+/* --- MP3: every frame is indexed once, then windows are decoded by byte range --- */
+const MP3_BR = [null,
+  [32,64,96,128,160,192,224,256,288,320,352,384,416,448],
+  [32,48,56,64,80,96,112,128,160,192,224,256,320,384],
+  [32,40,48,56,64,80,96,112,128,160,192,224,256,320],
+  [32,48,56,64,80,96,112,128,144,160,176,192,224,256],
+  [8,16,24,32,40,48,56,64,80,96,112,128,144,160]];
+const MP3_SR = { 3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000] };
+function mp3Header(b, i) {
+  if (i + 4 > b.length || b[i] !== 0xFF || (b[i + 1] & 0xE0) !== 0xE0) return null;
+  const ver = (b[i + 1] >> 3) & 3, layer = (b[i + 1] >> 1) & 3;
+  if (ver === 1 || layer === 0) return null;
+  const brIdx = b[i + 2] >> 4, srIdx = (b[i + 2] >> 2) & 3, pad = (b[i + 2] >> 1) & 1;
+  if (brIdx === 0 || brIdx === 15 || srIdx === 3 || (b[i + 3] & 3) === 2) return null;
+  const rate = MP3_SR[ver][srIdx], mpeg1 = ver === 3;
+  const table = mpeg1 ? (layer === 3 ? 1 : layer === 2 ? 2 : 3) : (layer === 3 ? 4 : 5);
+  const br = MP3_BR[table][brIdx - 1] * 1000;
+  let len, spf;
+  if (layer === 3) { len = (Math.floor(12 * br / rate) + pad) * 4; spf = 384; }
+  else if (layer === 2) { len = Math.floor(144 * br / rate) + pad; spf = 1152; }
+  else { spf = mpeg1 ? 1152 : 576; len = Math.floor(spf / 8 * br / rate) + pad; }
+  if (len < 24) return null;
+  return { len, spf, rate, mpeg1, mono: ((b[i + 3] >> 6) & 3) === 3 };
+}
+function isXingFrame(b, i, h) {
+  const side = h.mpeg1 ? (h.mono ? 17 : 32) : (h.mono ? 9 : 17);
+  const tag = (o) => o + 4 <= b.length ? String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]) : '';
+  const t = tag(i + 4 + side);
+  return t === 'Xing' || t === 'Info' || tag(i + 36) === 'VBRI';
+}
+async function openMp3(blob, onProgress) {
+  const CHUNK = 4 * 1024 * 1024;
+  let buf = new Uint8Array(0), bufStart = 0, pos = 0;
+  const load = async (at) => { buf = new Uint8Array(await readBytes(blob, at, at + CHUNK)); bufStart = at; };
+  await load(0);
+  if (buf.length > 10 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) {
+    const size = ((buf[6] & 0x7F) << 21) | ((buf[7] & 0x7F) << 14) | ((buf[8] & 0x7F) << 7) | (buf[9] & 0x7F);
+    pos = 10 + size + ((buf[5] & 0x10) ? 10 : 0);
+  }
+  let end = blob.size;
+  if (blob.size > 128) {
+    const tail = new Uint8Array(await readBytes(blob, blob.size - 128, blob.size));
+    if (tail[0] === 0x54 && tail[1] === 0x41 && tail[2] === 0x47) end -= 128;
+  }
+  const offsets = [];
+  let spf = 0, rate = 0, junk = 0, lastLen = 0, lastReport = 0;
+  while (pos + 4 <= end) {
+    if (pos + 4096 > bufStart + buf.length && bufStart + buf.length < end) await load(pos);
+    if (pos < bufStart) await load(pos);
+    const i = pos - bufStart;
+    const h = mp3Header(buf, i);
+    let ok = false;
+    if (h && (rate === 0 || (h.rate === rate && h.spf === spf))) {
+      const next = i + h.len;
+      if (pos + h.len + 4 > end) ok = true;
+      else if (next + 4 <= buf.length) { const h2 = mp3Header(buf, next); ok = !!h2 && h2.rate === h.rate && h2.spf === h.spf; }
+      else ok = true;
+    }
+    if (ok) {
+      if (rate === 0) { rate = h.rate; spf = h.spf; if (isXingFrame(buf, i, h)) { pos += h.len; continue; } }
+      offsets.push(pos); lastLen = h.len; pos += h.len;
+    } else { pos++; junk++; }
+    if (pos - lastReport > 16 * 1024 * 1024) {
+      lastReport = pos;
+      if (onProgress) onProgress(pos / end);
+      await sleep(0);
+    }
+  }
+  if (offsets.length < 8 || junk > 0.02 * end + 65536) return null;
+  const fps = rate / spf, n = offsets.length, PRE = 12, POST = 3;
+  // Encoder (576) + decoder (529) delay: mid-stream decodes carry no LAME
+  // header, so the browser cannot trim it — we do, for accurate timestamps.
+  const delay = Math.round(1105 * SR / rate);
+  return {
+    kind: 'mp3', durationSec: n / fps, srcRate: rate, channels: 0,
+    async read(startSec, endSec) {
+      const outLen = Math.max(0, Math.round((endSec - startSec) * SR));
+      const f0 = Math.max(0, Math.floor(startSec * fps) - PRE), f1 = Math.min(n, Math.ceil(endSec * fps) + POST);
+      if (f1 <= f0) return new Float32Array(outLen);
+      const bytes = await readBytes(blob, offsets[f0], f1 < n ? offsets[f1] : offsets[n - 1] + lastLen);
+      const ab = await browserDecode(bytes);
+      const mono = audioBufferToMono16k(ab);
+      return fitLength(mono, Math.max(0, Math.round((startSec - f0 / fps) * SR) + delay), outLen);
+    },
+    close() {},
+  };
+}
+
+/* --- Everything else: one browser decode, kept as 16-bit PCM --- */
+async function openFullDecode(blob) {
+  if (blob.size > 2.5 * 1024 * 1024 * 1024) {
+    throw new Error('This file is larger than 2.5 GB and its format cannot be streamed. Convert it to WAV or MP3 (which are read in chunks) and try again.');
+  }
+  const buf = await blob.arrayBuffer();
+  let ab;
+  try { ab = await browserDecode(buf); }
+  catch (err) {
+    throw new Error('This file could not be decoded as audio. Supported: MP3, WAV, MP4/M4A, OGG/Opus, WebM, FLAC, AAC. If it is a very long file, converting it to WAV or MP3 lets it be read in chunks. (' + ((err && err.message) || 'decode failed') + ')');
+  }
+  const ch = ab.numberOfChannels;
+  let pcm;
+  if (ab.sampleRate === SR) {
+    const n = ab.length; pcm = new Int16Array(n);
+    const chans = []; for (let c = 0; c < ch; c++) chans.push(ab.getChannelData(c));
+    for (let i = 0; i < n; i++) {
+      let s = 0; for (let c = 0; c < ch; c++) s += chans[c][i];
+      s = s / ch * 32767; pcm[i] = s > 32767 ? 32767 : s < -32768 ? -32768 : Math.round(s);
+    }
+  } else {
+    const mono = audioBufferToMono16k(ab);
+    pcm = new Int16Array(mono.length);
+    for (let i = 0; i < mono.length; i++) { const s = mono[i] * 32767; pcm[i] = s > 32767 ? 32767 : s < -32768 ? -32768 : Math.round(s); }
+  }
+  ab = null;
+  return {
+    kind: 'full', durationSec: pcm.length / SR, srcRate: SR, channels: ch,
+    async read(startSec, endSec) {
+      const a = Math.max(0, Math.round(startSec * SR)), b = Math.min(pcm.length, Math.round(endSec * SR));
+      const outLen = Math.max(0, Math.round((endSec - startSec) * SR));
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < b - a && i < outLen; i++) out[i] = pcm[a + i] / 32768;
+      return out;
+    },
+    close() { pcm = null; },
+  };
+}
+
+async function openAudioSource(blob, onProgress) {
+  const head = new Uint8Array(await readBytes(blob, 0, 16));
+  const s4 = head.length >= 4 ? String.fromCharCode(head[0], head[1], head[2], head[3]) : '';
+  const name = (blob.name || '').toLowerCase(), type = (blob.type || '').toLowerCase();
+  try {
+    if (s4 === 'RIFF' || s4 === 'RF64') { const w = await openWav(blob); if (w) return w; }
+    const looksMp3 = (head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33) || (head[0] === 0xFF && (head[1] & 0xE0) === 0xE0);
+    if (looksMp3 || type === 'audio/mpeg' || type === 'audio/mp3' || /\.mp3$/.test(name)) {
+      const m = await openMp3(blob, onProgress); if (m) return m;
+    }
+  } catch (e) { console.warn('Chunked reader failed; decoding the whole file instead.', e); }
+  return openFullDecode(blob);
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -677,14 +1257,28 @@ function newTranscript(name, opts) {
     language: opts.language,
     task: opts.task,
     quality: opts.quality,
+    modelId: opts.modelId || null,
     sourceName: opts.sourceName || null,
     sizeBytes: opts.sizeBytes || 0,
-    segments: [],              // {start, end, text}
+    segments: [],              // {start, end, text, spk}
+    speakers: null,            // {"0": "Alice", ...} custom names
+    speakerCount: 0,
+    diarized: false,
+    processedSec: 0,           // checkpoint for resume
     ai: null,                  // {label, text, at}
   };
 }
-function transcriptFullText(t, withTs) {
-  return (t.segments || []).map(s => withTs ? '[' + fmtClock(s.start) + '] ' + s.text : s.text).join('\n');
+function speakerName(t, spk) {
+  if (spk == null || spk < 0) return '';
+  return (t.speakers && t.speakers[spk]) || ('Speaker ' + (spk + 1));
+}
+function speakerColor(spk) { return SPEAKER_COLORS[(spk || 0) % SPEAKER_COLORS.length]; }
+function hasSpeakers(t) { return !!(t && t.segments && t.segments.some(s => s.spk != null && s.spk >= 0)); }
+function transcriptFullText(t, withTs, withSpk) {
+  const spk = withSpk !== false && hasSpeakers(t);
+  return (t.segments || []).map(s =>
+    (withTs ? '[' + fmtClock(s.start) + '] ' : '') + (spk && s.spk != null && s.spk >= 0 ? speakerName(t, s.spk) + ': ' : '') + s.text
+  ).join('\n');
 }
 async function saveTranscript(t) {
   t.updatedAt = Date.now();
@@ -693,13 +1287,43 @@ async function saveTranscript(t) {
 function getT(id) { return state.transcripts.find(t => t.id === id); }
 function sortLib() { state.transcripts.sort((a, b) => b.createdAt - a.createdAt); }
 
+// Give each Whisper cue the speaker who talked most during it.
+function assignSpeakers(segments, turns) {
+  if (!turns || !turns.length) return;
+  let j = 0;
+  for (const c of segments) {
+    while (j < turns.length && turns[j].end < c.start - 3) j++;
+    const ov = new Map(); let best = null, bestOv = 0;
+    for (let k = j; k < turns.length && turns[k].start < c.end + 3; k++) {
+      const o = Math.min(c.end, turns[k].end) - Math.max(c.start, turns[k].start);
+      if (o > 0) { const v = (ov.get(turns[k].spk) || 0) + o; ov.set(turns[k].spk, v); if (v > bestOv) { bestOv = v; best = turns[k].spk; } }
+    }
+    if (best === null) {
+      let bd = 1.5;
+      for (let k = j; k < turns.length && turns[k].start < c.end + 3; k++) {
+        const d = turns[k].start > c.end ? turns[k].start - c.end : c.start - turns[k].end;
+        if (d < bd) { bd = d; best = turns[k].spk; }
+      }
+    }
+    c.spk = best;
+  }
+  // a lone one-cue speaker sandwiched between the same neighbour is almost always the neighbour
+  for (let i = 1; i < segments.length - 1; i++) {
+    const a = segments[i - 1].spk, b = segments[i].spk, c = segments[i + 1].spk;
+    if (a != null && a === c && b !== a && (segments[i].end - segments[i].start) < 1.2 && wordCount(segments[i].text) <= 3) segments[i].spk = a;
+  }
+}
+
 /* ════════════════════════════════════════════════════════════════
    Transcription controller
    ════════════════════════════════════════════════════════════════ */
 function friendlyError(err) {
   const m = (err && err.message) || String(err);
-  if (/Failed to fetch|NetworkError|network|fetch dynamically|ERR_|load failed/i.test(m) && !/appears to block/i.test(m)) {
+  if (/Failed to fetch|NetworkError|network|fetch dynamically|ERR_|load failed/i.test(m) && !/appears to block|could not be found/i.test(m)) {
     return 'Could not download the AI model — your network may be blocking huggingface.co or the CDN. Check your connection and retry. (' + m + ')';
+  }
+  if (/out of memory|allocation failed|Array buffer allocation|Out of memory/i.test(m)) {
+    return 'The browser ran out of memory while processing this file. Try a smaller accuracy level, close other tabs, or convert the file to WAV/MP3 so it can be read in chunks. (' + m + ')';
   }
   return m;
 }
@@ -708,9 +1332,9 @@ function enqueueFiles(files) {
   const list = Array.from(files || []).filter(f => f && f.size > 0);
   if (!list.length) return;
   for (const f of list) {
-    if (f.size > 2.5 * 1024 * 1024 * 1024) { toast('⚠️', f.name + ' is larger than 2.5 GB — skipped.'); continue; }
     state.queue.push({ blob: f, name: f.name.replace(/\.[a-z0-9]+$/i, '') || f.name, sourceName: f.name });
   }
+  if (list.length > 1 && !state.job) toast('📚', list.length + ' files queued — they will be transcribed one after another.');
   processQueue();
 }
 
@@ -720,24 +1344,28 @@ function processQueue() {
   startTranscription(next.blob, next.name, next.sourceName);
 }
 
-async function startTranscription(blob, name, sourceName, existingId) {
+async function acquireWakeLock() {
+  try { if (navigator.wakeLock && !state.wakeLock) { state.wakeLock = await navigator.wakeLock.request('screen'); state.wakeLock.addEventListener('release', () => { state.wakeLock = null; }); } } catch (e) {}
+}
+function releaseWakeLock() {
+  if (state.wakeLock) { state.wakeLock.release().catch(() => {}); state.wakeLock = null; }
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && (state.job || rec.active)) acquireWakeLock(); });
+
+async function startTranscription(blob, name, sourceName, existingId, resume) {
   if (state.job) { state.queue.push({ blob, name, sourceName }); toast('⏳', 'Added to queue — one file is transcribed at a time.'); return; }
+  const s = state.settings;
   const opts = {
-    quality: state.settings.quality,
-    language: state.settings.language,
-    task: state.settings.task,
-    sourceName,
-    sizeBytes: blob.size,
+    quality: s.quality, modelId: activeModelId(s.quality), language: s.language, task: s.task,
+    sourceName, sizeBytes: blob.size, speakers: !!s.speakers, maxSpeakers: parseInt(s.maxSpeakers, 10) || 0,
   };
   let t;
   if (existingId) {
     t = getT(existingId);
     t.status = 'processing';
     t.error = null;
-    t.segments = [];
-    t.quality = opts.quality;
-    t.language = opts.language;
-    t.task = opts.task;
+    if (!resume) { t.segments = []; t.processedSec = 0; t.speakers = null; t.speakerCount = 0; t.diarized = false; }
+    t.quality = opts.quality; t.modelId = opts.modelId; t.language = opts.language; t.task = opts.task;
   } else {
     t = newTranscript(name, opts);
     state.transcripts.unshift(t);
@@ -745,20 +1373,28 @@ async function startTranscription(blob, name, sourceName, existingId) {
   const job = {
     tid: t.id,
     cancelled: false,
-    phase: 'Preparing audio…',
+    phase: 'Opening audio…',
     pct: null,             // null = indeterminate
     live: '',
     words: 0,
     startedAt: Date.now(),
+    transcribeStart: null,
+    audioDone: 0,
+    eta: null,
+    speed: null,
+    warn: '',
     dl: {},                // per-file download progress
+    resumeFrom: resume ? (t.processedSec || 0) : 0,
   };
   state.job = job;
+  acquireWakeLock();
 
   try {
     await saveTranscript(t);
     if (!existingId) await dbPut('audio', { id: t.id, blob, type: blob.type || 'application/octet-stream' });
   } catch (err) {
     state.job = null;
+    releaseWakeLock();
     toast('❌', 'Could not save to local storage: ' + err.message);
     return;
   }
@@ -766,79 +1402,142 @@ async function startTranscription(blob, name, sourceName, existingId) {
   renderSidebar();
   App.go('t/' + t.id);
 
-  const setPhase = (phase, pct) => {
-    job.phase = phase;
-    job.pct = pct;
+  const setPhase = (phase, pct) => { job.phase = phase; job.pct = pct; updateProcUI(); };
+  const dlProgress = (label) => (d) => {
+    if (d.file) job.dl[d.file] = { loaded: d.loaded, total: d.total };
+    let loaded = 0, total = 0;
+    for (const k in job.dl) { loaded += job.dl[k].loaded || 0; total += job.dl[k].total || 0; }
+    job.phase = 'Downloading ' + label + ' (one time, cached)…';
+    job.pct = total ? Math.min(100, Math.round(loaded / total * 100)) : null;
+    job.live = total ? fmtBytes(loaded) + ' of ' + fmtBytes(total) : '';
     updateProcUI();
   };
+  const assertLive = () => { if (job.cancelled) throw new Error('cancelled'); };
 
+  let src = null;
   try {
-    // 1. Decode
-    setPhase('Reading & preparing audio…', null);
-    await new Promise(r => setTimeout(r, 30));
-    const audio = await decodeToMono16k(blob);
-    if (job.cancelled) throw new Error('cancelled');
-    t.durationSec = audio.length / SR;
+    // 1. Open the audio (streamed where possible)
+    await sleep(30);
+    src = await openAudioSource(blob, (f) => { job.phase = 'Indexing audio…'; job.pct = Math.round(f * 100); updateProcUI(); });
+    assertLive();
+    t.durationSec = src.durationSec;
+    if (job.resumeFrom > t.durationSec) job.resumeFrom = 0;
     await saveTranscript(t);
     if (isCurrentView(t.id)) render();
 
-    // 2. Load model
-    const model = MODELS[t.quality] || MODELS.small;
+    // 2. Load the models
     setPhase('Loading AI model…', null);
-    const device = await engine.ensureLoaded(model.id, (d) => {
-      if (d.file) job.dl[d.file] = { loaded: d.loaded, total: d.total };
-      let loaded = 0, total = 0;
-      for (const k in job.dl) { loaded += job.dl[k].loaded || 0; total += job.dl[k].total || 0; }
-      const pct = total ? Math.min(100, Math.round(loaded / total * 100)) : null;
-      job.phase = 'Downloading AI model (one time, cached)…';
-      job.pct = pct;
-      job.live = total ? fmtBytes(loaded) + ' of ' + fmtBytes(total) : '';
-      updateProcUI();
-    });
-    if (job.cancelled) throw new Error('cancelled');
+    const device = await engine.ensureLoaded(opts.modelId, dlProgress('AI model'));
+    assertLive();
     state.gpu = device;
-    job.live = '';
-
-    // 3. Transcribe segment by segment
-    const segs = planSegments(audio);
-    const lang = t.language === 'auto' ? null : t.language;
-    for (let i = 0; i < segs.length; i++) {
-      if (job.cancelled) throw new Error('cancelled');
-      const { start, end } = segs[i];
-      setPhase('Transcribing ' + fmtClock(start / SR) + ' – ' + fmtClock(end / SR) +
-               (segs.length > 1 ? '  (part ' + (i + 1) + ' of ' + segs.length + ')' : ''),
-               Math.round(i / segs.length * 100));
-      if (isSilentSlice(audio, start, end)) continue;
-      const slice = audio.slice(start, end);
-      const cues = await engine.transcribe(slice, start / SR, lang, t.task);
-      if (job.cancelled) throw new Error('cancelled');
-      if (cues.length) {
-        t.segments.push(...cues);
-        job.words = wordCount(t.segments.map(c => c.text).join(' '));
-        job.live = cues[cues.length - 1].text;
-        await saveTranscript(t);
-        if (isCurrentView(t.id)) appendSegRows(cues, t.segments.length - cues.length);
+    job.dl = {}; job.live = '';
+    let diarOn = opts.speakers && t.durationSec > 3;
+    if (diarOn) {
+      try {
+        setPhase('Loading speaker models…', null);
+        await speakerEngine.ensureSpeakersLoaded(dlProgress('speaker models'));
+        await speakerEngine.resetSpeakers();
+      } catch (err) {
+        diarOn = false;
+        job.warn = 'Speaker identification is unavailable (' + friendlyError(err) + ') — transcribing without speaker labels.';
+        toast('⚠️', job.warn);
       }
-      setPhase(job.phase, Math.round((i + 1) / segs.length * 100));
+      job.dl = {}; job.live = '';
+    }
+    assertLive();
+
+    // 3. Transcribe window by window
+    const total = src.durationSec;
+    const lang = t.language === 'auto' ? null : t.language;
+    const diarPending = [];
+    let pos = (diarOn || !job.resumeFrom) ? 0 : job.resumeFrom;
+    job.transcribeStart = Date.now();
+    job.words = wordCount(t.segments.map(c => c.text).join(' '));
+    while (pos < total - 0.05) {
+      assertLive();
+      const remaining = total - pos;
+      let chunk;
+      try {
+        chunk = await src.read(pos, Math.min(total, pos + WINDOW_MAX));
+      } catch (err) {
+        if (src.kind === 'full') throw err;
+        console.warn('Chunked decode failed at ' + pos + 's, falling back to a full decode.', err);
+        src.close();
+        src = await openFullDecode(blob);
+        continue;
+      }
+      let cut = chunk.length;
+      if (remaining > WINDOW_MAX && chunk.length > WINDOW_TARGET * SR) cut = quietestCut(chunk, WINDOW_TARGET * SR, chunk.length);
+      const end = Math.min(total, pos + cut / SR);
+      const audio = conditionWindow(chunk.slice(0, cut));
+      const skipWhisper = end <= job.resumeFrom + 0.01;
+      setPhase((skipWhisper ? 'Re-analysing speakers ' : 'Transcribing ') + fmtClock(pos) + ' – ' + fmtClock(end) + '  of ' + fmtClock(total), Math.round(pos / total * 100));
+      if (!isSilent(audio)) {
+        if (diarOn) {
+          const p = speakerEngine.diarize(audio.slice(), pos).catch(err => {
+            if (diarOn && !job.cancelled) { diarOn = false; job.warn = 'Speaker identification stopped (' + friendlyError(err) + ').'; toast('⚠️', job.warn); }
+          });
+          diarPending.push(p);
+          if (diarPending.length > 3) await diarPending.shift();
+        }
+        if (!skipWhisper) {
+          const cues = await engine.transcribe(audio, pos, lang, t.task);
+          assertLive();
+          if (cues.length) {
+            const before = t.segments.length;
+            t.segments.push(...cues);
+            job.words = wordCount(t.segments.map(c => c.text).join(' '));
+            job.live = cues[cues.length - 1].text;
+            if (isCurrentView(t.id)) appendSegRows(t, cues, before);
+          }
+        }
+      }
+      assertLive();
+      if (!skipWhisper) t.processedSec = end;
+      job.audioDone += end - pos;
+      pos = end;
+      const elapsed = (Date.now() - job.transcribeStart) / 1000;
+      if (elapsed > 4 && job.audioDone > 0) { job.speed = job.audioDone / elapsed; job.eta = (total - pos) / job.speed; }
+      await saveTranscript(t);
+      setPhase(job.phase, Math.round(pos / total * 100));
+    }
+    src.close(); src = null;
+
+    // 4. Speakers
+    if (diarOn) {
+      setPhase('Identifying speakers…', null);
+      await Promise.all(diarPending);
+      assertLive();
+      try {
+        const { turns, count } = await speakerEngine.speakers(opts.maxSpeakers);
+        assignSpeakers(t.segments, turns);
+        t.speakerCount = count;
+        t.diarized = true;
+      } catch (err) {
+        job.warn = 'Speaker identification failed (' + friendlyError(err) + ').';
+        toast('⚠️', job.warn);
+      }
     }
 
-    // 4. Done
+    // 5. Done
     t.status = 'ready';
     t.error = null;
     await saveTranscript(t);
     state.job = null;
+    releaseWakeLock();
     renderSidebar();
     if (isCurrentView(t.id)) render();
     toast(t.segments.length ? '✅' : '⚠️',
-      t.segments.length ? '"' + t.title + '" transcribed — ' + wordCount(transcriptFullText(t)) + ' words.'
+      t.segments.length ? '"' + t.title + '" transcribed — ' + wordCount(transcriptFullText(t, false, false)) + ' words' + (t.speakerCount ? ', ' + t.speakerCount + ' speaker' + (t.speakerCount === 1 ? '' : 's') : '') + '.'
                         : 'No speech was detected in "' + t.title + '".');
   } catch (err) {
+    if (src) { try { src.close(); } catch (e) {} }
     const cancelled = job.cancelled || /^cancelled$/i.test((err && err.message) || '');
     if (cancelled) {
-      engine.reset();
+      engine.reset(); speakerEngine.reset();
       if (t.segments.length) {
         t.status = 'ready';
-        toast('⏹', 'Stopped — the partial transcript was saved.');
+        toast('⏹', 'Stopped — the partial transcript was saved. You can resume it later.');
       } else {
         t.status = 'error';
         t.error = 'Transcription was cancelled before any speech was processed.';
@@ -846,10 +1545,12 @@ async function startTranscription(blob, name, sourceName, existingId) {
     } else {
       t.status = 'error';
       t.error = friendlyError(err);
+      console.error(err);
       toast('❌', 'Transcription failed: ' + t.error);
     }
     await saveTranscript(t).catch(() => {});
     state.job = null;
+    releaseWakeLock();
     renderSidebar();
     if (isCurrentView(t.id)) render();
   }
@@ -859,51 +1560,103 @@ async function startTranscription(blob, name, sourceName, existingId) {
 function cancelJob() {
   if (state.job) state.job.cancelled = true;
   engine.reset();
+  speakerEngine.reset();
 }
 
-async function retryTranscription(id) {
-  const rec = await dbGet('audio', id);
+async function retryTranscription(id, resume) {
+  const rec2 = await dbGet('audio', id);
   const t = getT(id);
-  if (!rec || !rec.blob) { toast('⚠️', 'The original audio for this transcript is no longer stored, so it cannot be re-transcribed.'); return; }
-  startTranscription(rec.blob, t ? t.title : 'Recording', t && t.sourceName, id);
+  if (!rec2 || !rec2.blob) { toast('⚠️', 'The original audio for this transcript is no longer stored, so it cannot be re-transcribed.'); return; }
+  startTranscription(rec2.blob, t ? t.title : 'Recording', t && t.sourceName, id, !!resume);
+}
+function canResume(t) {
+  return !!(t && t.status !== 'processing' && t.processedSec > 0 && t.durationSec && t.processedSec < t.durationSec - 1 && t.segments.length);
 }
 
 function isCurrentView(id) { return state.route.view === 'transcript' && state.route.id === id; }
 
 window.addEventListener('beforeunload', (e) => {
-  if (state.job) { e.preventDefault(); e.returnValue = ''; }
+  if (state.job || rec.active) { e.preventDefault(); e.returnValue = ''; }
 });
 
 /* ════════════════════════════════════════════════════════════════
-   Recorder
+   Recorder — microphone and/or tab/system audio, with live captions
    ════════════════════════════════════════════════════════════════ */
-const rec = { active: false, paused: false, mr: null, stream: null, chunks: [], seconds: 0, timer: null, ctx: null, raf: null };
+const rec = {
+  active: false, paused: false, mr: null, streams: [], chunks: [], seconds: 0, timer: null, ctx: null, raf: null, discard: false,
+  live: { on: false, buf: [], len: 0, rate: 48000, pos: 0, text: '', busy: false, status: '', chunks: 0 },
+};
+const LIVE_MIN_SEC = 10, LIVE_MAX_SEC = 24;
 
 async function startRecording() {
   if (state.job) { toast('⏳', 'Wait for the current transcription to finish before recording.'); return; }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('❌', 'Microphone recording is not supported in this browser.'); return; }
   if (!window.MediaRecorder) { toast('❌', 'MediaRecorder is not supported in this browser.'); return; }
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-    });
-  } catch (e) {
-    toast('❌', 'Microphone access was denied. Allow microphone access in your browser settings and try again.');
-    return;
+  const source = state.settings.recSource || 'mic';
+  let sys = null, mic = null;
+  if (source !== 'mic') {
+    if (!navigator.mediaDevices.getDisplayMedia) { toast('❌', 'This browser cannot capture tab/system audio. Use Chrome or Edge, or record from the microphone.'); return; }
+    try {
+      sys = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true, selfBrowserSurface: 'exclude', systemAudio: 'include' });
+    } catch (e) {
+      toast('❌', 'Screen/tab sharing was cancelled — nothing was recorded.');
+      return;
+    }
+    sys.getVideoTracks().forEach(tr => tr.stop());
+    if (!sys.getAudioTracks().length) {
+      sys.getTracks().forEach(tr => tr.stop());
+      toast('⚠️', 'No audio was shared. In the sharing dialog choose a Chrome tab (or a screen on Windows) and tick “Share audio”.');
+      return;
+    }
   }
+  if (source !== 'system') {
+    try {
+      mic = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: source === 'mic', noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+      });
+    } catch (e) {
+      if (sys) sys.getTracks().forEach(tr => tr.stop());
+      toast('❌', 'Microphone access was denied. Allow microphone access in your browser settings and try again.');
+      return;
+    }
+  }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  rec.ctx = new AC();
+  const dest = rec.ctx.createMediaStreamDestination();
+  const an = rec.ctx.createAnalyser(); an.fftSize = 128;
+  const tap = rec.ctx.createScriptProcessor(4096, 1, 1);
+  const mute = rec.ctx.createGain(); mute.gain.value = 0;
+  rec.streams = [mic, sys].filter(Boolean);
+  for (const s of rec.streams) {
+    const n = rec.ctx.createMediaStreamSource(s);
+    n.connect(dest); n.connect(an); n.connect(tap);
+  }
+  tap.connect(mute); mute.connect(rec.ctx.destination);
+  if (sys) sys.getAudioTracks()[0].onended = () => { if (rec.active) { toast('ℹ️', 'Sharing ended — recording stopped.'); stopRecording(false); } };
+
   const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', ''].find(m => !m || MediaRecorder.isTypeSupported(m));
-  rec.stream = stream;
   rec.chunks = [];
-  rec.mr = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 128000 } : undefined);
+  rec.mr = new MediaRecorder(dest.stream, mime ? { mimeType: mime, audioBitsPerSecond: 128000 } : undefined);
   rec.mr.ondataavailable = (e) => { if (e.data && e.data.size) rec.chunks.push(e.data); };
   rec.mr.onstop = onRecordingStopped;
   rec.mr.start(1000);
   rec.active = true;
   rec.paused = false;
   rec.seconds = 0;
-  rec.timer = setInterval(() => { if (!rec.paused) { rec.seconds++; const el = $('#rec-timer'); if (el) el.textContent = fmtClock(rec.seconds); } }, 1000);
-  startRecViz(stream);
+  rec.discard = false;
+  Object.assign(rec.live, { on: !!state.settings.liveCaptions, buf: [], len: 0, rate: rec.ctx.sampleRate, pos: 0, text: '', busy: false, status: '', chunks: 0 });
+  tap.onaudioprocess = (e) => {
+    if (!rec.active || rec.paused || !rec.live.on) return;
+    const d = e.inputBuffer.getChannelData(0);
+    rec.live.buf.push(new Float32Array(d));
+    rec.live.len += d.length;
+  };
+  rec.timer = setInterval(() => {
+    if (!rec.paused) { rec.seconds++; const el = $('#rec-timer'); if (el) el.textContent = fmtClock(rec.seconds); }
+    maybeLiveCaption();
+  }, 1000);
+  acquireWakeLock();
+  startRecViz(an);
   renderRecCard();
 }
 function pauseRecording() {
@@ -921,8 +1674,11 @@ function stopRecording(discard) {
 function onRecordingStopped() {
   const chunks = rec.chunks, discard = rec.discard, secs = rec.seconds;
   const type = (rec.mr && rec.mr.mimeType) || 'audio/webm';
-  if (rec.stream) rec.stream.getTracks().forEach(tr => tr.stop());
-  rec.active = false; rec.paused = false; rec.mr = null; rec.stream = null; rec.chunks = []; rec.discard = false;
+  for (const s of rec.streams) s.getTracks().forEach(tr => tr.stop());
+  if (rec.ctx) { try { rec.ctx.close(); } catch (e) {} rec.ctx = null; }
+  rec.active = false; rec.paused = false; rec.mr = null; rec.streams = []; rec.chunks = []; rec.discard = false;
+  rec.live.buf = []; rec.live.len = 0;
+  releaseWakeLock();
   renderRecCard();
   if (discard) { toast('🗑️', 'Recording discarded.'); return; }
   const blob = new Blob(chunks, { type });
@@ -930,13 +1686,8 @@ function onRecordingStopped() {
   const name = 'Recording — ' + new Date().toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   startTranscription(blob, name, null);
 }
-function startRecViz(stream) {
+function startRecViz(an) {
   try {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    rec.ctx = new AC();
-    const an = rec.ctx.createAnalyser();
-    an.fftSize = 128;
-    rec.ctx.createMediaStreamSource(stream).connect(an);
     const data = new Uint8Array(an.frequencyBinCount);
     const draw = () => {
       rec.raf = requestAnimationFrame(draw);
@@ -956,37 +1707,99 @@ function startRecViz(stream) {
 function stopRecViz() {
   if (rec.raf) cancelAnimationFrame(rec.raf);
   rec.raf = null;
-  if (rec.ctx) { try { rec.ctx.close(); } catch (e) {} rec.ctx = null; }
+}
+
+// Live captions: every ~10-24 s of fresh audio (cut at a quiet moment)
+// goes through the engine while recording continues.
+async function maybeLiveCaption() {
+  const L = rec.live;
+  if (!rec.active || !L.on || L.busy) return;
+  const have = L.len / L.rate;
+  if (have < LIVE_MIN_SEC) return;
+  const raw = new Float32Array(L.len); let o = 0;
+  for (const b of L.buf) { raw.set(b, o); o += b.length; }
+  let cut = raw.length;
+  if (have < LIVE_MAX_SEC) {
+    // cut at the quietest 100 ms in the last 3 s; wait for a quieter moment if none is quiet enough
+    const frame = Math.round(0.1 * L.rate), from = Math.max(0, raw.length - Math.round(3 * L.rate));
+    let best = -1, bestE = Infinity;
+    for (let i = from; i + frame <= raw.length; i += frame) { let e = 0; for (let j = i; j < i + frame; j += 4) e += raw[j] * raw[j]; if (e < bestE) { bestE = e; best = i; } }
+    if (best < 0 || Math.sqrt(bestE / (frame / 4)) > 0.02) return;
+    cut = best + (frame >> 1);
+  }
+  L.buf = cut < raw.length ? [raw.slice(cut)] : [];
+  L.len = raw.length - cut;
+  const offset = L.pos;
+  L.pos += cut / L.rate;
+  L.busy = true;
+  try {
+    const modelId = activeModelId(state.settings.quality);
+    if (engine.loadedKey !== 'whisper|' + modelId + '|' + (state.settings.modelHost || '').trim()) {
+      L.status = 'Loading caption model…'; renderLiveCaption();
+      await engine.ensureLoaded(modelId, (d) => { L.status = 'Downloading caption model' + (d.total ? ' ' + Math.round(d.loaded / d.total * 100) + '%' : '') + '…'; renderLiveCaption(); });
+      L.status = '';
+    }
+    if (!rec.active) return;
+    const audio = conditionWindow(resampleTo16k(raw.subarray(0, cut), L.rate));
+    if (!isSilent(audio)) {
+      const lang = state.settings.language === 'auto' ? null : state.settings.language;
+      const cues = await engine.transcribe(audio, offset, lang, state.settings.task);
+      if (cues.length) { L.text = (L.text + ' ' + cues.map(c => c.text).join(' ')).trim(); L.chunks++; }
+    }
+  } catch (err) {
+    L.status = 'Live captions unavailable: ' + friendlyError(err);
+    L.on = false;
+  } finally {
+    L.busy = false;
+    renderLiveCaption();
+  }
+}
+function renderLiveCaption() {
+  const el = $('#live-cap');
+  if (!el) return;
+  const L = rec.live;
+  const tail = L.text.length > 600 ? '…' + L.text.slice(-600) : L.text;
+  el.innerHTML = (L.status ? '<div class="live-status">' + escapeHtml(L.status) + '</div>' : '') +
+    (tail ? '<div class="live-text">' + escapeHtml(tail) + '</div>' : (L.on && !L.status ? '<div class="live-status">Listening… live captions appear here after the first ~10 seconds of speech.</div>' : ''));
+  el.scrollTop = el.scrollHeight;
 }
 
 /* ════════════════════════════════════════════════════════════════
-   Exports
+   Exports (speaker-aware)
    ════════════════════════════════════════════════════════════════ */
+function spkPrefix(t, s, spk) { return spk && s.spk != null && s.spk >= 0 ? speakerName(t, s.spk) + ': ' : ''; }
 function toSrt(t) {
+  const spk = hasSpeakers(t);
   return (t.segments || []).map((s, i) =>
-    (i + 1) + '\n' + tsStamp(s.start, ',') + ' --> ' + tsStamp(s.end, ',') + '\n' + s.text + '\n'
+    (i + 1) + '\n' + tsStamp(s.start, ',') + ' --> ' + tsStamp(s.end, ',') + '\n' + spkPrefix(t, s, spk) + s.text + '\n'
   ).join('\n');
 }
 function toVtt(t) {
+  const spk = hasSpeakers(t);
   return 'WEBVTT\n\n' + (t.segments || []).map(s =>
-    tsStamp(s.start, '.') + ' --> ' + tsStamp(s.end, '.') + '\n' + s.text + '\n'
+    tsStamp(s.start, '.') + ' --> ' + tsStamp(s.end, '.') + '\n' +
+    (spk && s.spk != null && s.spk >= 0 ? '<v ' + speakerName(t, s.spk).replace(/[<>]/g, '') + '>' + s.text + '</v>' : s.text) + '\n'
   ).join('\n');
 }
 function toCsv(t) {
   const esc = v => '"' + String(v).replace(/"/g, '""') + '"';
-  return 'start,end,text\n' + (t.segments || []).map(s =>
-    s.start.toFixed(2) + ',' + s.end.toFixed(2) + ',' + esc(s.text)
+  return 'start,end,speaker,text\n' + (t.segments || []).map(s =>
+    s.start.toFixed(2) + ',' + s.end.toFixed(2) + ',' + esc(s.spk != null && s.spk >= 0 ? speakerName(t, s.spk) : '') + ',' + esc(s.text)
   ).join('\n');
 }
 function toJsonExport(t) {
+  const names = {};
+  for (let i = 0; i < (t.speakerCount || 0); i++) names[i] = speakerName(t, i);
   return JSON.stringify({
     title: t.title, createdAt: new Date(t.createdAt).toISOString(), durationSec: t.durationSec,
-    language: t.language, model: (MODELS[t.quality] || {}).id || t.quality,
-    segments: t.segments, text: transcriptFullText(t, false),
+    language: t.language, model: t.modelId || (MODELS[t.quality] || {}).id || t.quality,
+    speakers: names,
+    segments: (t.segments || []).map(s => ({ start: s.start, end: s.end, speaker: s.spk != null && s.spk >= 0 ? speakerName(t, s.spk) : null, text: s.text })),
+    text: transcriptFullText(t, false),
   }, null, 2);
 }
 
-/* Minimal DOCX writer — a real .docx is a zip of XML parts; we build
+/* Minimal ZIP/DOCX writer — a real .docx is a zip of XML parts; we build
    an uncompressed ("stored") zip by hand so no library is needed. */
 const CRC_TABLE = (() => {
   const tbl = new Uint32Array(256);
@@ -1002,7 +1815,7 @@ function crc32(u8) {
   for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
   return (c ^ 0xFFFFFFFF) >>> 0;
 }
-function zipStore(files) {
+function zipStore(files, mime) {
   const enc = new TextEncoder();
   const parts = [];
   const central = [];
@@ -1041,9 +1854,9 @@ function zipStore(files) {
     ch.setUint32(20, c.size, true);
     ch.setUint32(24, c.size, true);
     ch.setUint16(28, c.name.length, true);
+    ch.setUint32(42, c.offset, true);
     parts.push(ch.buffer, c.name);
     offset += 46 + c.name.length;
-    ch.setUint32(42, c.offset, true);
   }
   const end = new DataView(new ArrayBuffer(22));
   end.setUint32(0, 0x06054b50, true);
@@ -1052,18 +1865,27 @@ function zipStore(files) {
   end.setUint32(12, offset - cdStart, true);
   end.setUint32(16, cdStart, true);
   parts.push(end.buffer);
-  return new Blob(parts, { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+  return new Blob(parts, { type: mime || 'application/zip' });
 }
+function docxRun(text, props) { return '<w:r>' + (props ? '<w:rPr>' + props + '</w:rPr>' : '') + '<w:t xml:space="preserve">' + escXml(text) + '</w:t></w:r>'; }
 function makeDocx(t, withTs) {
   const enc = new TextEncoder();
+  const spk = hasSpeakers(t);
   const paras = [];
-  paras.push('<w:p><w:pPr><w:spacing w:after="120"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="36"/></w:rPr><w:t xml:space="preserve">' + escXml(t.title) + '</w:t></w:r></w:p>');
-  paras.push('<w:p><w:pPr><w:spacing w:after="240"/></w:pPr><w:r><w:rPr><w:color w:val="808080"/><w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">' +
-    escXml(fmtDate(t.createdAt) + '  ·  ' + fmtDur(t.durationSec) + '  ·  ' + wordCount(transcriptFullText(t)) + ' words  ·  transcribed with VoiceScript Studio') + '</w:t></w:r></w:p>');
+  paras.push('<w:p><w:pPr><w:spacing w:after="120"/></w:pPr>' + docxRun(t.title, '<w:b/><w:sz w:val="36"/>') + '</w:p>');
+  paras.push('<w:p><w:pPr><w:spacing w:after="240"/></w:pPr>' + docxRun(
+    fmtDate(t.createdAt) + '  ·  ' + fmtDur(t.durationSec) + '  ·  ' + wordCount(transcriptFullText(t, false, false)) + ' words' +
+    (t.speakerCount ? '  ·  ' + t.speakerCount + ' speakers' : '') + '  ·  transcribed with VoiceScript Studio', '<w:color w:val="808080"/><w:sz w:val="18"/>') + '</w:p>');
+  let prev = null;
   for (const s of (t.segments || [])) {
+    if (spk && s.spk !== prev) {
+      prev = s.spk;
+      const col = speakerColor(s.spk).replace('#', '').toUpperCase();
+      paras.push('<w:p><w:pPr><w:spacing w:before="200" w:after="60"/></w:pPr>' + docxRun(speakerName(t, s.spk), '<w:b/><w:color w:val="' + col + '"/>') + '</w:p>');
+    }
     let runs = '';
-    if (withTs) runs += '<w:r><w:rPr><w:color w:val="B08020"/><w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">[' + fmtClock(s.start) + '] </w:t></w:r>';
-    runs += '<w:r><w:t xml:space="preserve">' + escXml(s.text) + '</w:t></w:r>';
+    if (withTs) runs += docxRun('[' + fmtClock(s.start) + '] ', '<w:color w:val="B08020"/><w:sz w:val="18"/>');
+    runs += docxRun(s.text);
     paras.push('<w:p><w:pPr><w:spacing w:after="120"/></w:pPr>' + runs + '</w:p>');
   }
   const docXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
@@ -1085,7 +1907,7 @@ function makeDocx(t, withTs) {
     { name: '[Content_Types].xml', data: enc.encode(contentTypes) },
     { name: '_rels/.rels', data: enc.encode(rels) },
     { name: 'word/document.xml', data: enc.encode(docXml) },
-  ]);
+  ], 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
 }
 
 async function loadJsPdf() {
@@ -1111,17 +1933,27 @@ async function makePdf(t, withTs) {
   const doc = new jsPDF({ unit: 'pt', format: 'a4' });
   const pw = doc.internal.pageSize.getWidth(), ph = doc.internal.pageSize.getHeight();
   const margin = 56, maxW = pw - margin * 2, lineH = 16;
+  const spk = hasSpeakers(t);
   let y = margin;
+  const ensure = (h) => { if (y + h > ph - margin) { doc.addPage(); y = margin; } };
   doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(25);
   for (const line of doc.splitTextToSize(t.title, maxW)) { doc.text(line, margin, y); y += 22; }
   doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); doc.setTextColor(130);
-  doc.text(fmtDate(t.createdAt) + '  ·  ' + fmtDur(t.durationSec) + '  ·  ' + wordCount(transcriptFullText(t)) + ' words', margin, y);
+  doc.text(fmtDate(t.createdAt) + '  ·  ' + fmtDur(t.durationSec) + '  ·  ' + wordCount(transcriptFullText(t, false, false)) + ' words' + (t.speakerCount ? '  ·  ' + t.speakerCount + ' speakers' : ''), margin, y);
   y += 10; doc.setDrawColor(205); doc.line(margin, y, pw - margin, y); y += 22;
   doc.setFontSize(11); doc.setTextColor(35);
+  let prev = null;
   for (const s of (t.segments || [])) {
+    if (spk && s.spk !== prev) {
+      prev = s.spk;
+      ensure(lineH + 8); y += 6;
+      doc.setFont('helvetica', 'bold'); doc.setTextColor(60);
+      doc.text(speakerName(t, s.spk), margin, y); y += lineH;
+      doc.setFont('helvetica', 'normal'); doc.setTextColor(35);
+    }
     const text = (withTs ? '[' + fmtClock(s.start) + ']  ' : '') + s.text;
     for (const line of doc.splitTextToSize(text, maxW)) {
-      if (y > ph - margin) { doc.addPage(); y = margin; }
+      ensure(lineH);
       doc.text(line, margin, y);
       y += lineH;
     }
@@ -1151,7 +1983,7 @@ async function exportTranscript(id, fmt) {
     else if (fmt === 'audio') {
       const rec2 = await dbGet('audio', t.id);
       if (!rec2 || !rec2.blob) { toast('⚠️', 'The original audio is no longer stored.'); return; }
-      const ext = (rec2.type || '').includes('webm') ? '.webm' : (rec2.type || '').includes('mp4') ? '.m4a' : (rec2.type || '').includes('mpeg') ? '.mp3' : '.audio';
+      const ext = (rec2.type || '').includes('webm') ? '.webm' : (rec2.type || '').includes('mp4') ? '.m4a' : (rec2.type || '').includes('mpeg') ? '.mp3' : (rec2.type || '').includes('wav') ? '.wav' : '.audio';
       download(rec2.blob, base + ext);
     }
     toast('⬇️', fmt.toUpperCase() + ' exported.');
@@ -1159,52 +1991,125 @@ async function exportTranscript(id, fmt) {
     toast('❌', 'Export failed: ' + err.message);
   }
 }
+// Every finished transcript as TXT + SRT + JSON in one zip.
+function exportAll() {
+  const enc = new TextEncoder();
+  const files = [];
+  const used = new Set();
+  for (const t of state.transcripts) {
+    if (!t.segments || !t.segments.length) continue;
+    let base = safeName(t.title), n = 2;
+    while (used.has(base)) base = safeName(t.title) + ' (' + (n++) + ')';
+    used.add(base);
+    files.push({ name: base + '/' + base + '.txt', data: enc.encode(transcriptFullText(t, state.settings.exportTs)) });
+    files.push({ name: base + '/' + base + '.srt', data: enc.encode(toSrt(t)) });
+    files.push({ name: base + '/' + base + '.json', data: enc.encode(toJsonExport(t)) });
+  }
+  if (!files.length) { toast('⚠️', 'There are no finished transcripts to export.'); return; }
+  download(zipStore(files), 'voicescript-transcripts.zip');
+  toast('⬇️', files.length / 3 + ' transcripts exported as a ZIP.');
+}
 
 /* ════════════════════════════════════════════════════════════════
    AI assistant (optional — Anthropic API, user-supplied key)
    ════════════════════════════════════════════════════════════════ */
+const AI_MODEL = 'claude-opus-5';
+const AI_SINGLE_MAX = 500000;    // characters sent in one request
+const AI_CHUNK_CHARS = 350000;   // longer transcripts are processed part by part, then merged
 const AI_PRESETS = [
-  { key: 'clean',    label: '✨ Clean up',        prompt: 'Clean up this transcript: add punctuation and capitalization, fix obvious transcription errors, remove filler words (um, uh, you know, like), and split it into logical paragraphs. Preserve the original meaning and wording otherwise. Do not include timestamps in the output.' },
-  { key: 'summary',  label: '📝 Summary',         prompt: 'Write a concise summary of this transcript: 2–3 sentences of overview followed by the key points as a bulleted list.' },
-  { key: 'minutes',  label: '🗓️ Meeting minutes', prompt: 'Turn this transcript into structured meeting minutes with these sections: Overview, Topics discussed, Decisions made, Action items (with owners where mentioned), and Open questions. Use the timestamps to keep the order of discussion.' },
-  { key: 'actions',  label: '✅ Action items',    prompt: 'Extract every action item, commitment, or follow-up from this transcript as a checklist. For each item include the owner (if identifiable) and any deadline mentioned.' },
-  { key: 'speakers', label: '🗣️ Speaker labels',  prompt: 'Rewrite this transcript with inferred speaker labels (Speaker 1, Speaker 2, …) based on conversational turns and context. Clean up punctuation as you go. Do not include timestamps in the output.' },
-  { key: 'translate',label: '🌐 Translate → EN',  prompt: 'Translate this transcript into natural, fluent English, preserving meaning and tone. Split it into readable paragraphs.' },
-  { key: 'custom',   label: '⚙️ Custom…',         prompt: '' },
+  { key: 'clean',    label: '✨ Clean up',        reduce: false, prompt: 'Clean up this transcript: add punctuation and capitalization, fix obvious transcription errors, remove filler words (um, uh, you know, like), and split it into logical paragraphs. Keep speaker labels if present. Preserve the original meaning and wording otherwise. Do not include timestamps in the output.' },
+  { key: 'summary',  label: '📝 Summary',         reduce: true,  prompt: 'Write a concise summary of this transcript: 2–3 sentences of overview followed by the key points as a bulleted list.' },
+  { key: 'minutes',  label: '🗓️ Meeting minutes', reduce: true,  prompt: 'Turn this transcript into structured meeting minutes with these sections: Overview, Attendees (from speaker labels or context), Topics discussed, Decisions made, Action items (with owners where mentioned), and Open questions. Use the timestamps to keep the order of discussion.' },
+  { key: 'actions',  label: '✅ Action items',    reduce: true,  prompt: 'Extract every action item, commitment, or follow-up from this transcript as a checklist. For each item include the owner (if identifiable) and any deadline mentioned.' },
+  { key: 'speakers', label: '🗣️ Name speakers',   reduce: false, prompt: 'Rewrite this transcript with speaker labels. If the transcript already has labels such as "Speaker 1", infer each speaker\'s real name or role from context where possible and use it consistently; otherwise infer speaker changes from conversational turns. Clean up punctuation as you go. Do not include timestamps in the output.' },
+  { key: 'translate',label: '🌐 Translate → EN',  reduce: false, prompt: 'Translate this transcript into natural, fluent English, preserving meaning, tone and any speaker labels. Split it into readable paragraphs.' },
+  { key: 'qa',       label: '❓ Questions asked', reduce: true,  prompt: 'List every question that was asked in this transcript, who asked it (if identifiable), and whether/how it was answered.' },
+  { key: 'custom',   label: '⚙️ Custom…',         reduce: true,  prompt: '' },
 ];
+const AI_SYSTEM = 'You are an expert transcription editor and note-taker. Work only from the transcript provided by the user. Output only the requested result — no preamble, no commentary, no code fences.';
 
-async function callClaude(promptText, transcriptText) {
-  const key = (state.settings.apiKey || '').trim();
-  if (!key) throw new Error('no-key');
-  let input = transcriptText;
-  const MAX_CHARS = 600000;
-  if (input.length > MAX_CHARS) input = input.slice(0, MAX_CHARS) + '\n\n[Transcript truncated for length.]';
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': key,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-    },
-    body: JSON.stringify({
-      model: 'claude-opus-4-8',
-      max_tokens: 8192,
-      system: 'You are an expert transcription editor and note-taker. Work only from the transcript provided by the user. Output only the requested result — no preamble, no commentary, no code fences.',
-      messages: [{ role: 'user', content: promptText + '\n\n--- TRANSCRIPT (timestamps are [hh:mm:ss]) ---\n' + input }],
-    }),
-  });
-  let data = null;
-  try { data = await resp.json(); } catch (e) {}
-  if (!resp.ok || (data && data.error)) {
+function aiHeaders(key, withFallbacks) {
+  const h = {
+    'Content-Type': 'application/json',
+    'x-api-key': key,
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+  };
+  if (withFallbacks) h['anthropic-beta'] = 'server-side-fallback-2026-07-01';
+  return h;
+}
+// One streamed Messages request; onDelta receives the text so far.
+async function claudeStream(key, userText, onDelta, signal, withFallbacks) {
+  if (withFallbacks === undefined) withFallbacks = true;
+  const body = { model: AI_MODEL, max_tokens: 64000, stream: true, system: AI_SYSTEM, messages: [{ role: 'user', content: userText }] };
+  if (withFallbacks) body.fallbacks = 'default';
+  const resp = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: aiHeaders(key, withFallbacks), body: JSON.stringify(body), signal });
+  if (!resp.ok) {
+    let data = null;
+    try { data = await resp.json(); } catch (e) {}
     const msg = (data && data.error && data.error.message) || ('HTTP ' + resp.status);
+    if (resp.status === 400 && withFallbacks && /fallback|beta/i.test(msg)) return claudeStream(key, userText, onDelta, signal, false);
     if (resp.status === 401) throw new Error('Your API key was rejected (401). Check it in Settings.');
     if (resp.status === 429) throw new Error('Rate limited by the API — wait a moment and try again.');
     throw new Error(msg);
   }
-  const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
-  if (!text) throw new Error(data.stop_reason === 'refusal' ? 'The model declined this request.' : 'The model returned an empty response.');
-  return text + (data.stop_reason === 'max_tokens' ? '\n\n[Output truncated — the transcript may be too long for a single pass.]' : '');
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', text = '', stopReason = null, stopDetails = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) !== -1) {
+      const evt = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      for (const line of evt.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const json = line.slice(5).trim();
+        if (!json) continue;
+        let d; try { d = JSON.parse(json); } catch (e) { continue; }
+        if (d.type === 'content_block_delta' && d.delta && d.delta.type === 'text_delta') { text += d.delta.text; if (onDelta) onDelta(text); }
+        else if (d.type === 'message_delta') { const dl = d.delta || {}; if (dl.stop_reason) stopReason = dl.stop_reason; stopDetails = dl.stop_details || d.stop_details || stopDetails; }
+        else if (d.type === 'error') throw new Error((d.error && d.error.message) || 'Stream error');
+      }
+    }
+  }
+  if (stopReason === 'refusal') throw new Error('The model declined this request' + (stopDetails && stopDetails.category ? ' (' + stopDetails.category + ')' : '') + '.');
+  text = text.trim();
+  if (!text) throw new Error('The model returned an empty response.');
+  if (stopReason === 'max_tokens') text += '\n\n[Output truncated — the result reached the maximum length.]';
+  return text;
+}
+function splitTranscriptText(text, maxChars) {
+  const parts = []; let cur = '';
+  for (const line of text.split('\n')) {
+    if (cur.length + line.length + 1 > maxChars && cur) { parts.push(cur); cur = ''; }
+    cur += (cur ? '\n' : '') + line;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+// Runs a preset over the whole transcript. Long transcripts are processed
+// part by part and, for summarising tasks, merged with a final pass.
+async function runAssistant(preset, promptText, transcriptText, onProgress, signal) {
+  const key = (state.settings.apiKey || '').trim();
+  if (!key) throw new Error('no-key');
+  const framed = (body, note) => promptText + (note ? '\n\n' + note : '') + '\n\n--- TRANSCRIPT (timestamps are [hh:mm:ss]) ---\n' + body;
+  if (transcriptText.length <= AI_SINGLE_MAX) return claudeStream(key, framed(transcriptText), (txt) => onProgress(txt, ''), signal);
+  const parts = splitTranscriptText(transcriptText, AI_CHUNK_CHARS);
+  const outs = [];
+  for (let i = 0; i < parts.length; i++) {
+    const note = 'This is part ' + (i + 1) + ' of ' + parts.length + ' of a long transcript. Apply the instructions to this part only.';
+    const partial = await claudeStream(key, framed(parts[i], note), (txt) => onProgress(outs.concat([txt]).join('\n\n'), 'Part ' + (i + 1) + ' of ' + parts.length), signal);
+    outs.push(partial);
+  }
+  if (!preset.reduce) return outs.join('\n\n');
+  const combined = outs.map((o, i) => '--- RESULT FOR PART ' + (i + 1) + ' ---\n' + o).join('\n\n');
+  if (combined.length > AI_SINGLE_MAX) return outs.join('\n\n');
+  return claudeStream(key,
+    'The following are partial results produced by applying this instruction to consecutive parts of one long transcript:\n\n"' + promptText + '"\n\n' +
+    'Merge them into one coherent final result that satisfies the instruction for the whole transcript. Remove duplication, keep chronological order, and do not mention the parts.\n\n' + combined,
+    (txt) => onProgress(txt, 'Combining ' + parts.length + ' parts'), signal);
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -1232,8 +2137,8 @@ function renderSidebar() {
   list.innerHTML = items.map(t => {
     const active = isCurrentView(t.id) ? ' active' : '';
     const sub = t.status === 'processing' ? 'Transcribing…'
-              : t.status === 'error' ? 'Failed — open to retry'
-              : fmtDate(t.createdAt) + ' · ' + fmtDur(t.durationSec) + ' · ' + wordCount(transcriptFullText(t)) + ' w';
+              : t.status === 'error' ? (canResume(t) ? 'Paused at ' + fmtClock(t.processedSec) + ' — open to resume' : 'Failed — open to retry')
+              : fmtDate(t.createdAt) + ' · ' + fmtDur(t.durationSec) + ' · ' + wordCount(transcriptFullText(t, false, false)) + ' w' + (t.speakerCount ? ' · ' + t.speakerCount + ' spk' : '');
     return '<div class="lib-item' + active + '" onclick="App.go(\'t/' + t.id + '\')">' +
       '<div class="lib-ic">' + statusIcon(t) + '</div>' +
       '<div class="lib-meta"><div class="lib-title">' + escapeHtml(t.title) + '</div>' +
@@ -1243,6 +2148,16 @@ function renderSidebar() {
 
 function langOptions(sel) {
   return LANGS.map(l => '<option value="' + l[0] + '"' + (l[0] === sel ? ' selected' : '') + '>' + l[1] + '</option>').join('');
+}
+function qualityOptions(sel) {
+  return Object.keys(MODELS).map(k => '<option value="' + k + '"' + (k === sel ? ' selected' : '') + '>' + MODELS[k].label + '</option>').join('');
+}
+function speakerOptions(s) {
+  const cur = !s.speakers ? 'off' : String(parseInt(s.maxSpeakers, 10) || 0);
+  let html = '<option value="off"' + (cur === 'off' ? ' selected' : '') + '>Off</option>' +
+             '<option value="0"' + (cur === '0' ? ' selected' : '') + '>Identify speakers (auto)</option>';
+  for (let n = 1; n <= 10; n++) html += '<option value="' + n + '"' + (cur === String(n) ? ' selected' : '') + '>Up to ' + n + ' speaker' + (n > 1 ? 's' : '') + '</option>';
+  return html;
 }
 
 function renderHome() {
@@ -1256,31 +2171,30 @@ function renderHome() {
   '<div class="view">' +
     '<div class="home-hero">' +
       '<div><h1>Transcribe anything with <em>AI precision</em></h1>' +
-      '<p>Upload audio or video, or record live. Whisper AI runs entirely on this device — your files never leave your computer.</p></div>' +
+      '<p>Upload audio or video of any length, capture an online meeting, or record live. Whisper AI and speaker identification run entirely on this device — your files never leave your computer.</p></div>' +
       gpuBadge +
     '</div>' +
     '<div class="opts-row">' +
-      '<div class="field"><label>Accuracy</label><select id="opt-quality" onchange="App.setOpt(\'quality\', this.value)">' +
-        Object.keys(MODELS).map(k => '<option value="' + k + '"' + (k === s.quality ? ' selected' : '') + '>' + MODELS[k].label + '</option>').join('') +
-      '</select></div>' +
+      '<div class="field"><label>Accuracy</label><select id="opt-quality" onchange="App.setOpt(\'quality\', this.value)">' + qualityOptions(s.quality) + '</select></div>' +
       '<div class="field"><label>Spoken language</label><select id="opt-lang" onchange="App.setOpt(\'language\', this.value)">' + langOptions(s.language) + '</select></div>' +
       '<div class="field"><label>Output</label><select id="opt-task" onchange="App.setOpt(\'task\', this.value)">' +
         '<option value="transcribe"' + (s.task === 'transcribe' ? ' selected' : '') + '>Transcript (original language)</option>' +
         '<option value="translate"' + (s.task === 'translate' ? ' selected' : '') + '>Translate to English</option>' +
       '</select></div>' +
+      '<div class="field"><label>Speakers</label><select id="opt-spk" onchange="App.setSpeakerOpt(this.value)">' + speakerOptions(s) + '</select></div>' +
     '</div>' +
     '<div class="cards">' +
       '<div class="card">' +
-        '<h3>📁 Upload files</h3><div class="sub">MP3, MP4, M4A, WAV, OGG, WebM, FLAC, AAC… Multiple files are queued automatically.</div>' +
+        '<h3>📁 Upload files</h3><div class="sub">MP3, WAV, MP4, M4A, OGG, WebM, FLAC, AAC… Multiple files are queued automatically.</div>' +
         '<div class="dropzone" id="dropzone" onclick="document.getElementById(\'file-input\').click()">' +
           '<div class="dz-ic">📂</div><div class="dz-t">Click to browse, or drop files here</div>' +
-          '<div class="dz-s">Long recordings are fine — hours of audio are processed in chunks</div>' +
+          '<div class="dz-s">Any length — WAV and MP3 stream straight from disk, so even day-long recordings work</div>' +
         '</div>' +
       '</div>' +
       '<div class="card" id="rec-card"></div>' +
     '</div>' +
-    '<div class="privacy-note"><span>🔒</span><div><b>Private by design.</b> Transcription runs locally with on-device AI (Whisper). ' +
-    'The model downloads once (' + (MODELS[s.quality].label.match(/\(([^)]+)\)/) || ['',''])[1] + ') and is cached for offline-style use. ' +
+    '<div class="privacy-note"><span>🔒</span><div><b>Private by design.</b> Transcription and speaker identification run locally with on-device AI. ' +
+    'Models download once (' + escapeHtml(MODELS[s.quality] && MODELS[s.quality].size || 'size varies') + (s.speakers ? ' + ~35 MB for speakers' : '') + ') and are cached for offline-style use. ' +
     'Only the optional AI Assistant sends text to an API — and only when you use it.</div></div>' +
   '</div>';
   renderRecCard();
@@ -1295,9 +2209,19 @@ function renderHome() {
 function renderRecCard() {
   const card = $('#rec-card');
   if (!card) return;
+  const s = state.settings;
   if (!rec.active) {
+    const src = s.recSource || 'mic';
     card.innerHTML =
-      '<h3>🎙️ Record live</h3><div class="sub">Capture a meeting, lecture or voice note with your microphone, then transcribe it with the same AI engine.</div>' +
+      '<h3>🎙️ Record live</h3><div class="sub">Capture a meeting, lecture or voice note — from your microphone, or straight from a browser tab / your system for online calls.</div>' +
+      '<div class="rec-opts">' +
+        '<div class="field"><label>Source</label><select onchange="App.setOpt(\'recSource\', this.value)">' +
+          '<option value="mic"' + (src === 'mic' ? ' selected' : '') + '>Microphone</option>' +
+          '<option value="mic+system"' + (src === 'mic+system' ? ' selected' : '') + '>Microphone + tab/system audio (online meetings)</option>' +
+          '<option value="system"' + (src === 'system' ? ' selected' : '') + '>Tab/system audio only</option>' +
+        '</select></div>' +
+        '<label class="chk"><input type="checkbox" ' + (s.liveCaptions ? 'checked' : '') + ' onchange="App.setOpt(\'liveCaptions\', this.checked)"> Live captions while recording</label>' +
+      '</div>' +
       '<div class="rec-area">' +
         '<button class="rec-btn" onclick="App.startRec()" title="Start recording">●</button>' +
         '<div class="rec-state" style="margin-top:12px;">Tap to start recording</div>' +
@@ -1309,13 +2233,15 @@ function renderRecCard() {
     '<div class="rec-area">' +
       '<div class="viz" id="rec-viz">' + '<div class="bar"></div>'.repeat(36) + '</div>' +
       '<div class="rec-timer" id="rec-timer">' + fmtClock(rec.seconds) + '</div>' +
-      '<div class="rec-state">' + (rec.paused ? '⏸ paused' : '● recording') + '</div>' +
+      '<div class="rec-state">' + (rec.paused ? '⏸ paused' : '● recording') + (rec.streams.length > 1 ? ' · mic + system' : (state.settings.recSource === 'system' ? ' · system audio' : '')) + '</div>' +
       '<div class="rec-ctl">' +
         '<button class="btn" onclick="App.pauseRec()">' + (rec.paused ? '▶ Resume' : '⏸ Pause') + '</button>' +
         '<button class="btn btn-primary" onclick="App.stopRec(false)">⏹ Stop &amp; transcribe</button>' +
         '<button class="btn btn-ghost" onclick="App.stopRec(true)">Discard</button>' +
       '</div>' +
-    '</div>';
+    '</div>' +
+    (rec.live.on || rec.live.text || rec.live.status ? '<div class="live-cap" id="live-cap"></div>' : '');
+  renderLiveCaption();
 }
 
 function renderTranscript(id) {
@@ -1324,8 +2250,9 @@ function renderTranscript(id) {
     $('#main').innerHTML = '<div class="view"><div class="empty-view"><div class="big">🗂️</div>Transcript not found.<br><br><button class="btn" onclick="App.go(\'\')">← Back to home</button></div></div>';
     return;
   }
-  const words = wordCount(transcriptFullText(t));
+  const words = wordCount(transcriptFullText(t, false, false));
   const model = MODELS[t.quality] || {};
+  const modelLabel = t.quality === 'custom' ? (t.modelId || 'custom model') : (model.label || t.quality || '').split(' — ')[0];
   const langName = (LANGS.find(l => l[0] === t.language) || ['', t.language])[1];
   const processing = t.status === 'processing';
   const hasAi = !!t.ai;
@@ -1337,6 +2264,7 @@ function renderTranscript(id) {
         '<div class="proc-row"><div class="proc-label"><div class="spin"></div><span id="proc-phase"></span></div><span class="proc-pct" id="proc-pct"></span></div>' +
         '<div class="pbar" id="proc-bar"><div id="proc-fill"></div></div>' +
         '<div class="proc-live" id="proc-live"></div>' +
+        '<div class="proc-warn" id="proc-warn"></div>' +
         '<div class="proc-foot"><span class="proc-stats" id="proc-stats"></span>' +
         '<button class="btn btn-sm btn-danger" onclick="App.cancelJob()">⏹ Stop transcription</button></div>' +
       '</div>';
@@ -1344,12 +2272,20 @@ function renderTranscript(id) {
   let errHtml = '';
   if (t.status === 'error') {
     errHtml =
-      '<div class="err-box"><h4>⚠️ Transcription failed</h4><p>' + escapeHtml(t.error || 'Unknown error') + '</p>' +
-      '<button class="btn btn-primary btn-sm" onclick="App.retry(\'' + t.id + '\')">↻ Retry transcription</button></div>';
+      '<div class="err-box"><h4>⚠️ ' + (canResume(t) ? 'Transcription paused' : 'Transcription failed') + '</h4><p>' + escapeHtml(t.error || 'Unknown error') + '</p>' +
+      (canResume(t)
+        ? '<button class="btn btn-primary btn-sm" onclick="App.resume(\'' + t.id + '\')">▶ Resume from ' + fmtClock(t.processedSec) + '</button> ' +
+          '<button class="btn btn-sm" onclick="App.retry(\'' + t.id + '\')">↻ Start over</button>'
+        : '<button class="btn btn-primary btn-sm" onclick="App.retry(\'' + t.id + '\')">↻ Retry transcription</button>') +
+      '</div>';
+  } else if (!processing && canResume(t)) {
+    errHtml =
+      '<div class="resume-box"><span>⏸ Transcribed up to <b>' + fmtClock(t.processedSec) + '</b> of ' + fmtClock(t.durationSec) + '.</span>' +
+      '<button class="btn btn-primary btn-sm" onclick="App.resume(\'' + t.id + '\')">▶ Resume</button></div>';
   }
 
   const segsHtml = t.segments.length
-    ? '<div class="seg-wrap" id="seg-wrap">' + t.segments.map((s, i) => segRowHtml(s, i)).join('') + '</div>'
+    ? '<div class="seg-wrap' + (hasSpeakers(t) ? ' with-spk' : '') + '" id="seg-wrap">' + t.segments.map((s, i) => segRowHtml(t, s, i)).join('') + '</div>'
     : (processing ? '<div class="seg-wrap" id="seg-wrap"><div class="lib-empty">Recognized speech will appear here as it is transcribed…</div></div>'
        : (t.status === 'ready' ? '<div class="seg-wrap"><div class="lib-empty">No speech was detected in this audio.</div></div>' : ''));
 
@@ -1365,14 +2301,17 @@ function renderTranscript(id) {
       escapeHtml(t.ai.text) + '</div>'
     : '';
 
+  const speakerMeta = t.speakerCount ? '<span>' + t.speakerCount + ' speaker' + (t.speakerCount === 1 ? '' : 's') + '</span>' : '';
+  const speed = state.settings.playbackRate || 1;
+
   $('#main').innerHTML =
   '<div class="view">' +
     '<div class="tv-top">' +
       '<div style="min-width:0;flex:1;">' +
         '<div class="tv-title" id="tv-title" contenteditable="true" spellcheck="false">' + escapeHtml(t.title) + '</div>' +
-        '<div class="tv-meta"><span>' + fmtDate(t.createdAt) + '</span><span>' + fmtDur(t.durationSec) + '</span><span>' + words.toLocaleString() + ' words</span>' +
+        '<div class="tv-meta"><span>' + fmtDate(t.createdAt) + '</span><span>' + fmtDur(t.durationSec) + '</span><span>' + words.toLocaleString() + ' words</span>' + speakerMeta +
         '<span>' + escapeHtml(langName === 'Auto-detect' ? 'auto language' : langName) + (t.task === 'translate' ? ' → English' : '') + '</span>' +
-        '<span title="' + escapeHtml(model.id || '') + '">' + escapeHtml((model.label || t.quality || '').split(' — ')[0]) + '</span></div>' +
+        '<span title="' + escapeHtml(t.modelId || model.id || '') + '">' + escapeHtml(modelLabel) + '</span></div>' +
       '</div>' +
       '<div class="tv-actions">' +
         '<button class="btn btn-sm" onclick="App.openAI(\'' + t.id + '\')">🤖 AI assistant</button>' +
@@ -1392,11 +2331,15 @@ function renderTranscript(id) {
             '<div class="menu-sep"></div>' +
             '<label class="chk menu-chk"><input type="checkbox" ' + (state.settings.exportTs ? 'checked' : '') + ' onchange="App.setOpt(\'exportTs\', this.checked)" onclick="event.stopPropagation()"> Include timestamps</label>' +
           '</div></div>' +
-        '<button class="btn btn-sm btn-danger" onclick="App.deleteTranscript(\'' + t.id + '\')">🗑</button>' +
+        '<button class="btn btn-sm btn-danger" onclick="App.deleteTranscript(\'' + t.id + '\')" title="Delete">🗑</button>' +
       '</div>' +
     '</div>' +
     procHtml + errHtml +
-    '<div class="player-bar" id="player-bar" style="display:none;"><audio id="player" controls preload="metadata"></audio></div>' +
+    '<div class="player-bar" id="player-bar" style="display:none;"><audio id="player" controls preload="metadata"></audio>' +
+      '<div class="player-extra"><label>Speed <select onchange="App.setSpeed(this.value)">' +
+        [0.75, 1, 1.25, 1.5, 1.75, 2].map(v => '<option value="' + v + '"' + (v === speed ? ' selected' : '') + '>' + v + '×</option>').join('') +
+      '</select></label><span class="kbd-hint" title="Keyboard shortcuts">⌨ Ctrl+Enter play/pause · Ctrl+Shift+←/→ ±5 s · Ctrl+Shift+↑ play from the line you are editing</span></div>' +
+    '</div>' +
     '<div class="tv-toolbar">' +
       '<div class="sw"><span class="si">🔎</span><input id="tv-search" type="text" placeholder="Search in transcript…" value="' + escapeHtml(state.tvSearch) + '" oninput="App.searchTv(this.value)"><span class="sc" id="tv-count"></span></div>' +
       '<label class="chk"><input type="checkbox" ' + (state.follow ? 'checked' : '') + ' onchange="App.setFollow(this.checked)"> Follow playback</label>' +
@@ -1431,17 +2374,23 @@ function renderTranscript(id) {
   if (state.tvSearch) applyTvSearch();
 }
 
-function segRowHtml(s, i) {
-  return '<div class="seg" data-i="' + i + '">' +
+function segRowHtml(t, s, i) {
+  const prev = i > 0 ? t.segments[i - 1] : null;
+  const hasSpk = s.spk != null && s.spk >= 0;
+  const changed = hasSpk && (!prev || prev.spk !== s.spk);
+  return '<div class="seg' + (hasSpk ? ' has-spk' : '') + (changed ? ' spk-start' : '') + '" data-i="' + i + '"' + (hasSpk ? ' style="--spk:' + speakerColor(s.spk) + '"' : '') + '>' +
     '<button class="seg-t" onclick="App.seek(' + s.start.toFixed(2) + ')" title="Jump to ' + fmtClock(s.start) + '">' + fmtClock(s.start) + '</button>' +
-    '<div class="seg-x" contenteditable="true" spellcheck="false" data-i="' + i + '">' + escapeHtml(s.text) + '</div></div>';
+    '<div class="seg-body">' +
+      (changed ? '<button class="seg-spk" onclick="App.renameSpeaker(\'' + t.id + '\',' + s.spk + ')" title="Rename this speaker everywhere">' + escapeHtml(speakerName(t, s.spk)) + '</button>' : '') +
+      '<div class="seg-x" contenteditable="true" spellcheck="false" data-i="' + i + '">' + escapeHtml(s.text) + '</div>' +
+    '</div></div>';
 }
-function appendSegRows(cues, fromIndex) {
+function appendSegRows(t, cues, fromIndex) {
   const wrap = $('#seg-wrap');
   if (!wrap) return;
   const empty = wrap.querySelector('.lib-empty');
   if (empty) empty.remove();
-  const html = cues.map((c, k) => segRowHtml(c, fromIndex + k)).join('');
+  const html = cues.map((c, k) => segRowHtml(t, c, fromIndex + k)).join('');
   wrap.insertAdjacentHTML('beforeend', html);
 }
 
@@ -1457,6 +2406,7 @@ async function attachPlayer(t) {
     }
     if (!state.player.url) return;
     player.src = state.player.url;
+    player.playbackRate = state.settings.playbackRate || 1;
     bar.style.display = '';
     let lastIdx = -1;
     player.ontimeupdate = () => {
@@ -1489,14 +2439,21 @@ async function attachPlayer(t) {
 function updateProcUI() {
   const job = state.job;
   if (!job || !isCurrentView(job.tid)) { renderSidebarThrottled(); return; }
-  const phase = $('#proc-phase'), pct = $('#proc-pct'), fill = $('#proc-fill'), bar = $('#proc-bar'), live = $('#proc-live'), stats = $('#proc-stats');
+  const phase = $('#proc-phase'), pct = $('#proc-pct'), fill = $('#proc-fill'), bar = $('#proc-bar'), live = $('#proc-live'), stats = $('#proc-stats'), warn = $('#proc-warn');
   if (!phase) return;
   phase.textContent = job.phase;
   if (job.pct == null) { bar.classList.add('indet'); pct.textContent = ''; }
   else { bar.classList.remove('indet'); fill.style.width = job.pct + '%'; pct.textContent = job.pct + '%'; }
   live.textContent = job.live || '';
+  if (warn) { warn.textContent = job.warn || ''; warn.style.display = job.warn ? '' : 'none'; }
   const mins = Math.round((Date.now() - job.startedAt) / 6000) / 10;
-  stats.textContent = (job.words ? job.words.toLocaleString() + ' words · ' : '') + mins + ' min elapsed' + (state.gpu ? ' · ' + (state.gpu === 'webgpu' ? 'GPU' : 'CPU') : '');
+  const bits = [];
+  if (job.words) bits.push(job.words.toLocaleString() + ' words');
+  bits.push(mins + ' min elapsed');
+  if (job.speed) bits.push(job.speed.toFixed(1) + '× realtime');
+  if (job.eta != null && job.eta > 0) bits.push(fmtEta(job.eta) + ' left');
+  if (state.gpu) bits.push(state.gpu === 'webgpu' ? 'GPU' : 'CPU');
+  stats.textContent = bits.join(' · ');
 }
 const renderSidebarThrottled = debounce(renderSidebar, 800);
 
@@ -1559,6 +2516,25 @@ function confirmDialog(title, msg, okLabel) {
     $('#cf-yes').onclick = () => { closeModal(); res(true); };
   });
 }
+function promptDialog(title, label, value, okLabel) {
+  return new Promise(res => {
+    openModal(
+      '<div class="modal" style="max-width:420px;">' +
+        '<div class="modal-h"><h3>' + escapeHtml(title) + '</h3><button class="x-btn" id="pd-x">✕</button></div>' +
+        '<div class="modal-b"><div class="row field"><label>' + escapeHtml(label) + '</label><input class="txt-input" id="pd-in" type="text" value="' + escapeHtml(value || '') + '" maxlength="60"></div>' +
+        '<div style="display:flex;gap:10px;justify-content:flex-end;">' +
+          '<button class="btn" id="pd-no">Cancel</button>' +
+          '<button class="btn btn-primary" id="pd-yes">' + escapeHtml(okLabel || 'Save') + '</button>' +
+        '</div></div></div>');
+    const input = $('#pd-in');
+    const done = (ok) => { const v = input.value.trim(); closeModal(); res(ok ? v : null); };
+    $('#pd-no').onclick = () => done(false);
+    $('#pd-x').onclick = () => done(false);
+    $('#pd-yes').onclick = () => done(true);
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); done(true); } });
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+  });
+}
 
 async function openSettings() {
   const s = state.settings;
@@ -1571,14 +2547,27 @@ async function openSettings() {
   '<div class="modal">' +
     '<div class="modal-h"><h3>⚙️ Settings</h3><button class="x-btn" onclick="App.closeModal()">✕</button></div>' +
     '<div class="modal-b">' +
-      '<div class="row field"><label>Default accuracy</label><select onchange="App.setOpt(\'quality\', this.value)">' +
-        Object.keys(MODELS).map(k => '<option value="' + k + '"' + (k === s.quality ? ' selected' : '') + '>' + MODELS[k].label + '</option>').join('') +
-      '</select><div class="hint">Higher accuracy models are larger and slower. Each model downloads once and is cached by your browser.' +
-      (state.gpu === 'wasm' ? ' Your browser has no WebGPU, so “Maximum” will be slow — “Balanced” is recommended.' : '') + '</div></div>' +
+      '<div class="row field"><label>Default accuracy</label><select onchange="App.setOpt(\'quality\', this.value)">' + qualityOptions(s.quality) + '</select>' +
+      '<div class="hint">Higher accuracy models are larger and slower. Each model downloads once and is cached by your browser.' +
+      (state.gpu === 'wasm' ? ' Your browser has no WebGPU, so “Maximum” and “Ultimate” will be slow — “Balanced” is recommended.' : '') + '</div></div>' +
       '<div class="row field"><label>Default language</label><select onchange="App.setOpt(\'language\', this.value)">' + langOptions(s.language) + '</select></div>' +
+      '<div class="row field"><label>Speakers</label><select onchange="App.setSpeakerOpt(this.value)">' + speakerOptions(s) + '</select>' +
+      '<div class="hint">Speaker identification (pyannote + WeSpeaker, on-device) labels who said what. Set the number of speakers when you know it for the most accurate result.</div></div>' +
       '<div class="row field"><label>Anthropic API key (optional — for the AI assistant)</label>' +
         '<input class="txt-input" type="password" placeholder="sk-ant-…" value="' + escapeHtml(s.apiKey || '') + '" onchange="App.setOpt(\'apiKey\', this.value.trim())">' +
         '<div class="hint">Enables Clean up, Summary, Meeting minutes and more. The key is stored only in this browser and sent only to api.anthropic.com. Get one at <a href="https://console.anthropic.com/" target="_blank" rel="noopener">console.anthropic.com</a>.</div></div>' +
+      '<details class="adv"><summary>Advanced</summary>' +
+        '<div class="row field" style="margin-top:12px;"><label>Custom Whisper model (Hugging Face repo with ONNX weights)</label>' +
+          '<input class="txt-input" type="text" placeholder="e.g. onnx-community/whisper-small.en or a fine-tuned model" value="' + escapeHtml(s.customModel || '') + '" onchange="App.setOpt(\'customModel\', this.value.trim())">' +
+          '<div class="hint">Used when Accuracy is set to “Custom model”. Lets you run English-only, distilled, or domain fine-tuned Whisper variants.</div></div>' +
+        '<div class="row field"><label>Model host / mirror (optional)</label>' +
+          '<input class="txt-input" type="text" placeholder="https://huggingface.co/  (default)" value="' + escapeHtml(s.modelHost || '') + '" onchange="App.setOpt(\'modelHost\', this.value.trim())">' +
+          '<div class="hint">For networks that block huggingface.co: point this at a mirror or your own server that serves the same paths.</div></div>' +
+        '<div class="row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">' +
+          '<button class="btn btn-sm" id="preload-btn" onclick="App.preloadModels()">⬇ Download models now</button>' +
+          '<button class="btn btn-sm" onclick="App.exportAll()">🗜 Export all transcripts (.zip)</button>' +
+          '<span class="hint" style="margin:0;" id="preload-status">Pre-download the selected models so transcription works offline later.</span></div>' +
+      '</details>' +
       '<div class="row"><div class="danger-zone"><p><b style="color:var(--text);">Delete all data</b><br>Removes every transcript and stored audio file from this browser. ' + usage + '</p>' +
         '<button class="btn btn-danger btn-sm" onclick="App.wipeAll()">Delete all</button></div></div>' +
       '<div class="hint" style="text-align:center;">VoiceScript Studio · on-device Whisper transcription · no account, no upload, no tracking</div>' +
@@ -1589,8 +2578,9 @@ function openAI(id) {
   const t = getT(id);
   if (!t || !t.segments.length) { toast('⚠️', 'There is no transcript text to work with yet.'); return; }
   const hasKey = !!(state.settings.apiKey || '').trim();
+  const chars = transcriptFullText(t, true).length;
   openModal(
-  '<div class="modal" style="max-width:620px;">' +
+  '<div class="modal" style="max-width:640px;">' +
     '<div class="modal-h"><h3>🤖 AI assistant</h3><button class="x-btn" onclick="App.closeModal()">✕</button></div>' +
     '<div class="modal-b">' +
       (!hasKey
@@ -1601,11 +2591,13 @@ function openAI(id) {
         : '<div class="row"><div class="chips" id="ai-chips">' +
             AI_PRESETS.map((p, i) => '<div class="chip' + (i === 0 ? ' sel' : '') + '" data-k="' + p.key + '" onclick="App.pickPreset(this)">' + p.label + '</div>').join('') +
           '</div></div>' +
-          '<div class="row" id="ai-custom-row" style="display:none;"><textarea class="txt-area" id="ai-custom" placeholder="Describe what you want, e.g. “Turn this into a blog post” or “List every question that was asked”…"></textarea></div>' +
-          '<div class="row" style="display:flex;gap:10px;align-items:center;">' +
+          '<div class="row" id="ai-custom-row" style="display:none;"><textarea class="txt-area" id="ai-custom" placeholder="Describe what you want, e.g. “Turn this into a blog post” or “List every decision with who made it”…"></textarea></div>' +
+          '<div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
             '<button class="btn btn-primary" id="ai-run" onclick="App.runAI(\'' + id + '\')">Run →</button>' +
-            '<span class="hint" style="margin:0;">Model: Claude Opus 4.8 · sent directly to api.anthropic.com</span></div>' +
-          '<div class="row" id="ai-status" style="display:none;"></div>'
+            '<button class="btn" id="ai-stop" style="display:none;" onclick="App.stopAI()">Stop</button>' +
+            '<span class="hint" style="margin:0;">Claude Opus 5 · streamed directly from api.anthropic.com' + (chars > AI_SINGLE_MAX ? ' · long transcript: processed in ' + Math.ceil(chars / AI_CHUNK_CHARS) + ' parts' : '') + '</span></div>' +
+          '<div class="row" id="ai-status" style="display:none;"></div>' +
+          '<pre class="ai-stream" id="ai-stream" style="display:none;"></pre>'
       ) +
     '</div></div>');
 }
@@ -1635,6 +2627,7 @@ function render() {
 function closeAllMenus() { $$('.menu.open').forEach(m => m.classList.remove('open')); }
 document.addEventListener('click', (e) => { if (!e.target.closest('.menu-wrap')) closeAllMenus(); });
 
+let aiAbort = null;
 const App = {
   go(path) { const target = '#/' + path; if (location.hash === target || (path === '' && (location.hash === '' || location.hash === '#/'))) render(); else location.hash = target; },
   toggleSidebar(open) {
@@ -1645,15 +2638,26 @@ const App = {
   setOpt(key, val) {
     state.settings[key] = val;
     dbPut('settings', { key: 'app', value: state.settings }).catch(() => {});
+    if (key === 'recSource' || key === 'liveCaptions') renderRecCard();
+  },
+  setSpeakerOpt(v) {
+    if (v === 'off') { App.setOpt('speakers', false); }
+    else { state.settings.speakers = true; App.setOpt('maxSpeakers', parseInt(v, 10) || 0); }
   },
   startRec() { startRecording(); },
   pauseRec() { pauseRecording(); },
   stopRec(discard) { stopRecording(discard); },
   cancelJob() { cancelJob(); },
-  retry(id) { retryTranscription(id); },
+  retry(id) { retryTranscription(id, false); },
+  resume(id) { retryTranscription(id, true); },
   seek(sec) {
     const p = $('#player');
     if (p && p.src) { p.currentTime = Math.max(0, sec - 0.1); p.play().catch(() => {}); }
+  },
+  setSpeed(v) {
+    const r = parseFloat(v) || 1;
+    App.setOpt('playbackRate', r);
+    const p = $('#player'); if (p) p.playbackRate = r;
   },
   setFollow(v) { state.follow = v; },
   setTab(tab) { state.tvTab = tab; render(); },
@@ -1666,12 +2670,23 @@ const App = {
     if (!was) menu.classList.add('open');
   },
   exp(id, fmt) { closeAllMenus(); exportTranscript(id, fmt); },
+  exportAll() { exportAll(); },
   copyTranscript(id) {
     const t = getT(id);
     if (!t || !t.segments.length) { toast('⚠️', 'Nothing to copy yet.'); return; }
     navigator.clipboard.writeText(transcriptFullText(t, state.settings.exportTs)).then(
       () => toast('📋', 'Transcript copied to clipboard.'),
       () => toast('❌', 'Could not access the clipboard.'));
+  },
+  async renameSpeaker(id, spk) {
+    const t = getT(id);
+    if (!t) return;
+    const name = await promptDialog('Rename speaker', 'Name for ' + speakerName(t, spk) + ' (applies to every line)', speakerName(t, spk), 'Rename');
+    if (name == null) return;
+    t.speakers = t.speakers || {};
+    if (name && name !== 'Speaker ' + (spk + 1)) t.speakers[spk] = name; else delete t.speakers[spk];
+    await saveTranscript(t);
+    render();
   },
   async deleteTranscript(id) {
     const t = getT(id);
@@ -1689,7 +2704,7 @@ const App = {
   },
   openSettings() { openSettings(); },
   openAI(id) { openAI(id); },
-  closeModal() { closeModal(); },
+  closeModal() { if (aiAbort) { aiAbort.abort(); aiAbort = null; } closeModal(); },
   saveAiKey(id) {
     const v = ($('#ai-key').value || '').trim();
     if (!v) { toast('⚠️', 'Paste your API key first.'); return; }
@@ -1711,23 +2726,40 @@ const App = {
       prompt = ($('#ai-custom').value || '').trim();
       if (!prompt) { toast('⚠️', 'Describe what you want the assistant to do.'); return; }
     }
-    const btn = $('#ai-run'), status = $('#ai-status');
-    btn.disabled = true; btn.textContent = 'Running…';
-    status.style.display = '';
-    status.innerHTML = '<div class="proc-label"><div class="spin"></div><span>Claude is working on your transcript…</span></div>';
+    const btn = $('#ai-run'), stop = $('#ai-stop'), status = $('#ai-status'), stream = $('#ai-stream');
+    btn.disabled = true; btn.textContent = 'Running…'; stop.style.display = '';
+    status.style.display = ''; stream.style.display = ''; stream.textContent = '';
+    status.innerHTML = '<div class="proc-label"><div class="spin"></div><span id="ai-stage">Claude is working on your transcript…</span></div>';
+    aiAbort = new AbortController();
+    const signal = aiAbort.signal;
     try {
-      const out = await callClaude(prompt, transcriptFullText(t, true));
+      const out = await runAssistant(preset, prompt, transcriptFullText(t, true), (txt, stage) => {
+        if (signal.aborted) return;
+        const st = $('#ai-stage'); if (st && stage) st.textContent = stage + '…';
+        const el = $('#ai-stream'); if (el) { el.textContent = txt; el.scrollTop = el.scrollHeight; }
+      }, signal);
+      if (signal.aborted) return;
       t.ai = { label: preset.key === 'custom' ? 'Custom prompt' : preset.label.replace(/^\S+\s/, ''), text: out, at: Date.now() };
       await saveTranscript(t);
+      aiAbort = null;
       closeModal();
       state.tvTab = 'ai';
       render();
       toast('✨', 'AI result ready — saved with this transcript.');
     } catch (err) {
+      if (signal.aborted) return;
       if (err.message === 'no-key') { closeModal(); openAI(id); return; }
       status.innerHTML = '<p style="color:var(--red);font-size:13px;line-height:1.6;">' + escapeHtml(err.message) + '</p>';
-      btn.disabled = false; btn.textContent = 'Run →';
+      btn.disabled = false; btn.textContent = 'Run →'; stop.style.display = 'none';
+      aiAbort = null;
     }
+  },
+  stopAI() {
+    if (aiAbort) { aiAbort.abort(); aiAbort = null; }
+    const btn = $('#ai-run'), stop = $('#ai-stop'), status = $('#ai-status');
+    if (btn) { btn.disabled = false; btn.textContent = 'Run →'; }
+    if (stop) stop.style.display = 'none';
+    if (status) status.innerHTML = '<p class="hint" style="margin:0;">Stopped.</p>';
   },
   copyAi(id) {
     const t = getT(id);
@@ -1736,6 +2768,24 @@ const App = {
   downloadAi(id) {
     const t = getT(id);
     if (t && t.ai) download(new Blob([t.ai.text], { type: 'text/markdown;charset=utf-8' }), safeName(t.title) + ' — ' + safeName(t.ai.label) + '.md');
+  },
+  async preloadModels() {
+    const btn = $('#preload-btn'), st = $('#preload-status');
+    if (state.job) { toast('⏳', 'Wait for the current transcription to finish.'); return; }
+    btn.disabled = true;
+    const say = (m) => { if (st) st.textContent = m; };
+    const prog = (label) => (d) => say('Downloading ' + label + (d.total ? ' — ' + fmtBytes(d.loaded) + ' of ' + fmtBytes(d.total) : '') + '…');
+    try {
+      say('Loading AI model…');
+      const dev = await engine.ensureLoaded(activeModelId(state.settings.quality), prog('AI model'));
+      state.gpu = dev;
+      if (state.settings.speakers) { say('Loading speaker models…'); await speakerEngine.ensureSpeakersLoaded(prog('speaker models')); }
+      say('Models are downloaded and cached — ready to transcribe offline.');
+      toast('✅', 'Models downloaded and cached.');
+    } catch (err) {
+      say('Download failed: ' + friendlyError(err));
+    }
+    btn.disabled = false;
   },
   async wipeAll() {
     const ok = await confirmDialog('Delete all data?', 'Every transcript, recording and cached setting will be removed from this browser. This cannot be undone.', 'Delete everything');
@@ -1751,7 +2801,26 @@ const App = {
 };
 window.App = App;
 // Internals handle for automated tests and console debugging.
-window.__vs = { state, engine, decodeToMono16k, planSegments, toSrt, toVtt, toCsv, toJsonExport, makeDocx, transcriptFullText, getT, startTranscription };
+window.__vs = { state, engine, speakerEngine, openAudioSource, openWav, openMp3, openFullDecode, resampleTo16k, conditionWindow, quietestCut, assignSpeakers, toSrt, toVtt, toCsv, toJsonExport, makeDocx, transcriptFullText, getT, startTranscription, splitTranscriptText, zipStore, saveTranscript, newTranscript };
+
+// Keyboard shortcuts for transcript editing
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('#overlay').classList.contains('open')) { App.closeModal(); return; }
+  if (state.route.view !== 'transcript') return;
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod) return;
+  if (e.target && (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT')) return;
+  const p = $('#player');
+  if (!p || !p.src) return;
+  if (e.key === 'Enter') { e.preventDefault(); if (p.paused) p.play().catch(() => {}); else p.pause(); }
+  else if (e.shiftKey && e.key === 'ArrowLeft') { e.preventDefault(); p.currentTime = Math.max(0, p.currentTime - 5); }
+  else if (e.shiftKey && e.key === 'ArrowRight') { e.preventDefault(); p.currentTime = Math.min(p.duration || 0, p.currentTime + 5); }
+  else if (e.shiftKey && e.key === 'ArrowUp') {
+    const el = document.activeElement && document.activeElement.closest('.seg-x');
+    const t = getT(state.route.id);
+    if (el && t) { e.preventDefault(); const s = t.segments[parseInt(el.dataset.i, 10)]; if (s) App.seek(s.start); }
+  }
+});
 
 async function updateStorageInfo() {
   try {
@@ -1774,9 +2843,12 @@ $('#file-input').addEventListener('change', function() { enqueueFiles(this.files
     state.transcripts = all || [];
     let dirty = false;
     for (const t of state.transcripts) {
+      if (t.processedSec == null) t.processedSec = 0;
       if (t.status === 'processing') {
-        t.status = t.segments && t.segments.length ? 'ready' : 'error';
-        if (t.status === 'error') t.error = 'Transcription was interrupted (the page was closed). Retry below.';
+        t.status = 'error';
+        t.error = canResume(t)
+          ? 'Transcription was interrupted (the page was closed) at ' + fmtClock(t.processedSec) + '. Resume below to continue from there.'
+          : 'Transcription was interrupted (the page was closed). Retry below.';
         dirty = true;
       }
     }
