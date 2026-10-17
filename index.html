@@ -347,7 +347,10 @@ async function loadWhisper(msg) {
         : { device: 'wasm', dtype: 'q8' };
       pipe = await m.pipeline('automatic-speech-recognition', msg.model, Object.assign({}, opts, { progress_callback: onProg }));
     } catch (err) {
-      if (device === 'webgpu' && !/404|could not locate/i.test((err && err.message) || '')) {
+      // Any GPU failure (no fp16 support, missing GPU weights, driver
+      // trouble) falls back to the CPU build of the same model.
+      if (device === 'webgpu') {
+        console.warn('WebGPU model load failed, using the CPU instead.', err);
         device = 'wasm';
         try {
           pipe = await m.pipeline('automatic-speech-recognition', msg.model, { device: 'wasm', dtype: 'q8', progress_callback: onProg });
@@ -383,21 +386,67 @@ function isBoilerplate(t) {
   return BOILERPLATE.some(re => re.test(s));
 }
 
+// Whisper's own language identification: one decoder step after
+// <|startoftranscript|> on the loudest 30 s, scored over the language
+// tokens. (transformers.js does not do this itself — without a language
+// it silently assumes English.)
+async function detectLanguage(audio) {
+  const model = pipe.model, gc = (model && model.generation_config) || {};
+  const langs = gc.lang_to_id;
+  if (!gc.is_multilingual || !langs || !pipe.processor || !mod.Tensor) return null;
+  const N = 30 * SR;
+  let start = 0;
+  if (audio.length > N) {
+    const B = SR, nb = Math.floor(audio.length / B), e = new Float64Array(nb);
+    for (let b = 0; b < nb; b++) { let s = 0; for (let j = b * B; j < (b + 1) * B; j += 4) s += audio[j] * audio[j]; e[b] = s; }
+    const w = Math.min(30, nb); let sum = 0, best = -1;
+    for (let b = 0; b < nb; b++) {
+      sum += e[b]; if (b >= w) sum -= e[b - w];
+      if (b >= w - 1 && sum > best) { best = sum; start = (b - w + 1) * B; }
+    }
+  }
+  const inputs = await pipe.processor(audio.subarray(start, Math.min(audio.length, start + N)));
+  const sot = gc.decoder_start_token_id;
+  const out = await model({ input_features: inputs.input_features, decoder_input_ids: new mod.Tensor('int64', BigInt64Array.from([BigInt(sot)]), [1, 1]) });
+  let logits = out.logits;
+  if (logits.type !== 'float32') { if (!logits.to) return null; logits = logits.to('float32'); }
+  const V = logits.dims[logits.dims.length - 1], base = logits.data.length - V;
+  let code = null, bv = -Infinity;
+  for (const tok in langs) { const v = Number(logits.data[base + langs[tok]]); if (v > bv) { bv = v; code = tok; } }
+  for (const k in out) { if (k !== 'logits' && out[k] && typeof out[k].dispose === 'function') { try { out[k].dispose(); } catch (e) {} } }
+  return code ? code.replace(/^<\|/, '').replace(/\|>$/, '') : null;
+}
+// Non-speech markers Whisper writes into otherwise good text.
+const INLINE_TAGS = /\s*[\[(](?:blank[_ ]audio|silence|no speech|inaudible)[\])]\s*/gi;
+
 async function transcribe(msg) {
   if (!pipe) throw new Error('Model not loaded');
+  const gc = (pipe.model && pipe.model.generation_config) || {};
+  const multilingual = !!gc.is_multilingual;
   const opts = {
-    task: msg.task || 'transcribe',
     chunk_length_s: 30,
     stride_length_s: 5,
     return_timestamps: true,
     no_repeat_ngram_size: 5,
   };
-  if (msg.language) opts.language = msg.language;
+  let language = msg.language || null, detected = null;
+  if (multilingual) {
+    opts.task = msg.task || 'transcribe';
+    if (!language && msg.detect) {
+      try { detected = await detectLanguage(msg.audio); } catch (err) { console.warn('Language detection failed; assuming English.', err); }
+      language = detected;
+    }
+    if (language) opts.language = language;
+  }
   const result = await pipe(msg.audio, opts);
   const raw = (result && result.chunks && result.chunks.length) ? result.chunks : [{ text: (result && result.text) || '', timestamp: [0, null] }];
+  // A broken GPU path (fp16 overflow, driver bugs) yields text made only of
+  // punctuation such as "!!!!!!" for audio that has speech in it.
+  const allText = raw.map(c => c.text || '').join('').replace(/\s+/g, '');
+  const suspect = allText.length >= 3 && /^[\p{P}\p{S}]+$/u.test(allText);
   const cues = []; let prev = '';
   for (const c of raw) {
-    const t = (c.text || '').trim();
+    const t = (c.text || '').replace(INLINE_TAGS, ' ').trim();
     if (!t) continue;
     if (isHallucinated(t) || isBoilerplate(t)) continue;
     if (t === prev && t.length > 8) continue;
@@ -407,7 +456,7 @@ async function transcribe(msg) {
     const en = (typeof ts[1] === 'number' && isFinite(ts[1])) ? ts[1] : s + 4;
     cues.push({ start: msg.offset + s, end: msg.offset + Math.max(en, s + 0.2), text: t });
   }
-  return cues;
+  return { cues: cues, language: detected, suspect: suspect, device: device };
 }
 
 /* ── Speaker diarization ─────────────────────────────────────── */
@@ -586,8 +635,8 @@ self.onmessage = async function (e) {
       const dev = await loadWhisper(msg);
       self.postMessage({ type: 'loaded', id: msg.id, device: dev });
     } else if (msg.type === 'transcribe') {
-      const cues = await transcribe(msg);
-      self.postMessage({ type: 'result', id: msg.id, cues: cues });
+      const out = await transcribe(msg);
+      self.postMessage({ type: 'result', id: msg.id, cues: out.cues, language: out.language, suspect: out.suspect, device: out.device });
     } else if (msg.type === 'loadDiar') {
       await loadDiar(msg);
       self.postMessage({ type: 'loaded', id: msg.id, device: 'wasm' });
@@ -732,6 +781,7 @@ const DEFAULT_SETTINGS = {
   speakers: true, maxSpeakers: 0,          // diarization on/off, 0 = detect the number of speakers
   customModel: '', modelHost: '',          // advanced: any ONNX Whisper repo id / model mirror
   exportTs: false, liveCaptions: true, recSource: 'mic',
+  useGpu: true,                            // WebGPU when available; off = always CPU
 };
 const state = {
   transcripts: [],           // full records, newest first
@@ -815,6 +865,9 @@ class Engine {
     this.loadedKey = null;
     this.pending = new Map();
     this.onDownload = null;
+    this.cpuOnly = false;      // set after the GPU path misbehaved this session
+    this.modelId = null;
+    this.lastLanguage = null;  // language Whisper detected on the last request
   }
   _spawn() {
     return new Promise((resolve) => {
@@ -873,13 +926,27 @@ class Engine {
   async ensureLoaded(modelId, onDownload) {
     this.onDownload = onDownload || null;
     const host = (state.settings.modelHost || '').trim();
+    const cpu = this.cpuOnly || state.settings.useGpu === false;
     const key = 'whisper|' + modelId + '|' + host;
-    if (this.loadedKey === key && this.device) { this.onDownload = null; return this.device; }
-    const res = await this._request({ type: 'load', model: modelId, cdnUrls: CDN_SOURCES, host });
+    if (this.loadedKey === key && this.device && (!cpu || this.device === 'wasm')) { this.onDownload = null; return this.device; }
+    if (!cpu && this.device === 'wasm' && this.worker) this.reset();   // GPU re-enabled: start a fresh worker
+    const res = await this._request({ type: 'load', model: modelId, cdnUrls: CDN_SOURCES, host, forceDevice: cpu ? 'wasm' : null });
     this.loadedKey = key;
+    this.modelId = modelId;
     this.device = res.device;
     this.onDownload = null;
     return res.device;
+  }
+  // The GPU produced an error or garbage: restart the worker on the CPU
+  // for the rest of this session.
+  async fallbackToCpu(reason) {
+    console.warn('WebGPU transcription failed, switching to the CPU.', reason);
+    const modelId = this.modelId;
+    this.reset();
+    this.cpuOnly = true;
+    state.gpu = 'wasm';
+    toast('⚠️', 'Your graphics card returned an error, so transcription switched to the CPU. It will be slower but accurate.');
+    await this.ensureLoaded(modelId);
   }
   async ensureSpeakersLoaded(onDownload) {
     this.onDownload = onDownload || null;
@@ -891,7 +958,21 @@ class Engine {
     this.onDownload = null;
   }
   async transcribe(audio, offsetSec, language, task) {
-    const res = await this._request({ type: 'transcribe', audio, offset: offsetSec, language: language || null, task: task || 'transcribe' }, [audio.buffer]);
+    const gpu = this.device === 'webgpu';
+    const copy = gpu ? audio.slice() : null;    // the buffer is transferred to the worker
+    let res;
+    try {
+      res = await this._request({ type: 'transcribe', audio, offset: offsetSec, language: language || null, detect: !language, task: task || 'transcribe' }, [audio.buffer]);
+    } catch (err) {
+      if (!gpu || /^cancelled$/i.test((err && err.message) || '')) throw err;
+      await this.fallbackToCpu(err);
+      return this.transcribe(copy, offsetSec, language, task);
+    }
+    if (gpu && res.suspect) {
+      await this.fallbackToCpu('GPU output was only punctuation');
+      return this.transcribe(copy, offsetSec, language, task);
+    }
+    this.lastLanguage = res.language || null;
     return res.cues;
   }
   diarize(audio, offsetSec) { return this._request({ type: 'diarize', audio, offset: offsetSec }, [audio.buffer]); }
@@ -968,20 +1049,40 @@ function rmsOf(x) {
   let s = 0; for (let i = 0; i < x.length; i += 2) s += x[i] * x[i];
   return Math.sqrt(s / Math.max(1, Math.ceil(x.length / 2)));
 }
-// High-pass (rumble/hum) + gentle level normalisation, in place.
+// How loud the speech in a window is: the 99.5th-percentile RMS of 30 ms
+// frames. Unlike the overall RMS it is not dragged down by long pauses (a
+// meeting window can be mostly silence), and unlike the peak it ignores a
+// stray click or bump.
+const SILENCE_LEVEL = 0.0005;   // ≈ -66 dBFS: below this there is nothing to transcribe
+const TARGET_LEVEL = 0.25;      // loud speech frames end up around -12 dBFS
+const MAX_GAIN = 60;            // up to +36 dB for distant / quiet recordings
+function speechLevel(x) {
+  const F = 480, n = Math.floor(x.length / F);
+  if (n < 1) return rmsOf(x);
+  const lv = new Float32Array(n);
+  for (let f = 0, o = 0; f < n; f++, o += F) {
+    let s = 0; for (let j = o; j < o + F; j += 2) s += x[j] * x[j];
+    lv[f] = Math.sqrt(s / (F / 2));
+  }
+  lv.sort();
+  return lv[Math.min(n - 1, Math.floor(0.995 * n))];
+}
+// High-pass (rumble/hum) + level normalisation, in place. Quiet recordings
+// are boosted so the speech sits at a consistent level; anything that would
+// then exceed full scale is soft-limited instead of clipped.
 function conditionWindow(x) {
   if (!x.length) return x;
   highpassInPlace(x, SR, 80);
-  let peak = 0, sum = 0;
-  for (let i = 0; i < x.length; i++) { const v = x[i], a = v < 0 ? -v : v; if (a > peak) peak = a; sum += v * v; }
-  const rms = Math.sqrt(sum / x.length);
-  let g = 1;
-  if (peak > 0.95) g = 0.95 / peak;
-  else if (rms > 0.0025 && peak > 0.001 && peak < 0.5) g = Math.min(0.9 / peak, 12);
-  if (g !== 1) for (let i = 0; i < x.length; i++) x[i] *= g;
+  const level = speechLevel(x);
+  if (level < SILENCE_LEVEL) return x;
+  const g = Math.min(TARGET_LEVEL / level, MAX_GAIN);
+  for (let i = 0; i < x.length; i++) {
+    const y = x[i] * g, a = y < 0 ? -y : y;
+    x[i] = a <= 0.9 ? y : (y < 0 ? -1 : 1) * (0.9 + 0.1 * Math.tanh((a - 0.9) / 0.1));
+  }
   return x;
 }
-function isSilent(x) { return rmsOf(x) < 0.004; }
+function isSilent(x) { return speechLevel(x) < SILENCE_LEVEL; }
 // Index of the quietest 120 ms frame in [from, to) — used to cut windows between words.
 function quietestCut(x, from, to) {
   const frame = Math.round(0.12 * SR);
@@ -1430,6 +1531,7 @@ async function startTranscription(blob, name, sourceName, existingId, resume) {
     const device = await engine.ensureLoaded(opts.modelId, dlProgress('AI model'));
     assertLive();
     state.gpu = device;
+    if (t.language === 'auto' && !job.resumeFrom) t.detectedLanguage = null;
     job.dl = {}; job.live = '';
     let diarOn = opts.speakers && t.durationSec > 3;
     if (diarOn) {
@@ -1448,7 +1550,7 @@ async function startTranscription(blob, name, sourceName, existingId, resume) {
 
     // 3. Transcribe window by window
     const total = src.durationSec;
-    const lang = t.language === 'auto' ? null : t.language;
+    let lang = t.language === 'auto' ? (t.detectedLanguage || null) : t.language;
     const diarPending = [];
     let pos = (diarOn || !job.resumeFrom) ? 0 : job.resumeFrom;
     job.transcribeStart = Date.now();
@@ -1481,8 +1583,10 @@ async function startTranscription(blob, name, sourceName, existingId, resume) {
           if (diarPending.length > 3) await diarPending.shift();
         }
         if (!skipWhisper) {
+          engine.lastLanguage = null;
           const cues = await engine.transcribe(audio, pos, lang, t.task);
           assertLive();
+          if (!lang && engine.lastLanguage) { lang = engine.lastLanguage; t.detectedLanguage = lang; }
           if (cues.length) {
             const before = t.segments.length;
             t.segments.push(...cues);
@@ -1584,7 +1688,7 @@ window.addEventListener('beforeunload', (e) => {
    ════════════════════════════════════════════════════════════════ */
 const rec = {
   active: false, paused: false, mr: null, streams: [], chunks: [], seconds: 0, timer: null, ctx: null, raf: null, discard: false,
-  live: { on: false, buf: [], len: 0, rate: 48000, pos: 0, text: '', busy: false, status: '', chunks: 0 },
+  live: { on: false, buf: [], len: 0, rate: 48000, pos: 0, text: '', busy: false, status: '', chunks: 0, lang: null },
 };
 const LIVE_MIN_SEC = 10, LIVE_MAX_SEC = 24;
 
@@ -1644,7 +1748,7 @@ async function startRecording() {
   rec.paused = false;
   rec.seconds = 0;
   rec.discard = false;
-  Object.assign(rec.live, { on: !!state.settings.liveCaptions, buf: [], len: 0, rate: rec.ctx.sampleRate, pos: 0, text: '', busy: false, status: '', chunks: 0 });
+  Object.assign(rec.live, { on: !!state.settings.liveCaptions, buf: [], len: 0, rate: rec.ctx.sampleRate, pos: 0, text: '', busy: false, status: '', chunks: 0, lang: null });
   tap.onaudioprocess = (e) => {
     if (!rec.active || rec.paused || !rec.live.on) return;
     const d = e.inputBuffer.getChannelData(0);
@@ -1742,8 +1846,10 @@ async function maybeLiveCaption() {
     if (!rec.active) return;
     const audio = conditionWindow(resampleTo16k(raw.subarray(0, cut), L.rate));
     if (!isSilent(audio)) {
-      const lang = state.settings.language === 'auto' ? null : state.settings.language;
+      const lang = state.settings.language === 'auto' ? (L.lang || null) : state.settings.language;
+      engine.lastLanguage = null;
       const cues = await engine.transcribe(audio, offset, lang, state.settings.task);
+      if (!lang && engine.lastLanguage) L.lang = engine.lastLanguage;
       if (cues.length) { L.text = (L.text + ' ' + cues.map(c => c.text).join(' ')).trim(); L.chunks++; }
     }
   } catch (err) {
@@ -2253,7 +2359,8 @@ function renderTranscript(id) {
   const words = wordCount(transcriptFullText(t, false, false));
   const model = MODELS[t.quality] || {};
   const modelLabel = t.quality === 'custom' ? (t.modelId || 'custom model') : (model.label || t.quality || '').split(' — ')[0];
-  const langName = (LANGS.find(l => l[0] === t.language) || ['', t.language])[1];
+  const langOf = (code) => (LANGS.find(l => l[0] === code) || ['', code])[1];
+  const langName = t.language === 'auto' && t.detectedLanguage ? langOf(t.detectedLanguage) + ' (detected)' : langOf(t.language);
   const processing = t.status === 'processing';
   const hasAi = !!t.ai;
 
@@ -2563,6 +2670,8 @@ async function openSettings() {
         '<div class="row field"><label>Model host / mirror (optional)</label>' +
           '<input class="txt-input" type="text" placeholder="https://huggingface.co/  (default)" value="' + escapeHtml(s.modelHost || '') + '" onchange="App.setOpt(\'modelHost\', this.value.trim())">' +
           '<div class="hint">For networks that block huggingface.co: point this at a mirror or your own server that serves the same paths.</div></div>' +
+        '<div class="row field"><label class="chk"><input type="checkbox" ' + (s.useGpu !== false ? 'checked' : '') + ' onchange="App.setOpt(\'useGpu\', this.checked)"> Use GPU acceleration (WebGPU) when available</label>' +
+          '<div class="hint">Turn this off if transcripts come back empty or garbled on this computer — everything then runs on the CPU, which is slower but works everywhere.' + (engine.cpuOnly ? ' The GPU reported an error this session, so the CPU is being used.' : '') + '</div></div>' +
         '<div class="row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">' +
           '<button class="btn btn-sm" id="preload-btn" onclick="App.preloadModels()">⬇ Download models now</button>' +
           '<button class="btn btn-sm" onclick="App.exportAll()">🗜 Export all transcripts (.zip)</button>' +
@@ -2801,7 +2910,7 @@ const App = {
 };
 window.App = App;
 // Internals handle for automated tests and console debugging.
-window.__vs = { state, engine, speakerEngine, openAudioSource, openWav, openMp3, openFullDecode, resampleTo16k, conditionWindow, quietestCut, assignSpeakers, toSrt, toVtt, toCsv, toJsonExport, makeDocx, transcriptFullText, getT, startTranscription, splitTranscriptText, zipStore, saveTranscript, newTranscript };
+window.__vs = { state, engine, speakerEngine, openAudioSource, openWav, openMp3, openFullDecode, resampleTo16k, conditionWindow, isSilent, speechLevel, quietestCut, assignSpeakers, toSrt, toVtt, toCsv, toJsonExport, makeDocx, transcriptFullText, getT, startTranscription, splitTranscriptText, zipStore, saveTranscript, newTranscript };
 
 // Keyboard shortcuts for transcript editing
 document.addEventListener('keydown', (e) => {

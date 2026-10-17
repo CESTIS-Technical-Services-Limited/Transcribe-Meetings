@@ -29,15 +29,19 @@ your computer.
   on reload, and the screen is kept awake while a job runs.
 - **Accurate AI engine** — Whisper (Tiny → Large-v3) via
   [transformers.js](https://github.com/huggingface/transformers.js), with:
-  - WebGPU acceleration (automatic, with CPU/WASM fallback)
+  - WebGPU acceleration (automatic). If the GPU fails to load the model, errors
+    mid-job, or returns garbage, the app switches to the CPU and redoes that part;
+    Settings → Advanced → *Use GPU acceleration* turns the GPU off entirely
   - two Web Workers: Whisper and speaker analysis run in parallel, the UI never freezes
-  - audio conditioning: band-limited 16 kHz resampling, 80 Hz high-pass, level normalisation
+  - audio conditioning: band-limited 16 kHz resampling, 80 Hz high-pass, level normalisation that
+    boosts quiet or distant recordings by up to +36 dB
   - silence-aware windowing so long recordings are cut between words
   - repetition suppression plus hallucination/boilerplate filtering
   - any ONNX Whisper model from the Hugging Face Hub (English-only, distilled or
     domain fine-tuned variants) via Settings → Advanced, and a configurable model
     mirror for locked-down networks
-- **99 languages** with auto-detection, plus "translate to English" mode.
+- **99 languages** with real auto-detection (Whisper's own language ID on the
+  loudest 30 s; the detected language is shown on the transcript), plus "translate to English" mode.
 - **Transcript workspace** — timestamped segments, click a timestamp to jump the
   audio player, follow-along highlighting, playback speed, keyboard shortcuts
   (Ctrl+Enter play/pause, Ctrl+Shift+←/→ seek, Ctrl+Shift+↑ play from the line
@@ -106,7 +110,8 @@ in a secure context).
 2. Audio is processed in ~2 minute windows, each cut at the quietest moment in the
    last 55 seconds so words are never chopped, then resampled to 16 kHz mono with
    a band-limited windowed-sinc filter, high-passed at 80 Hz and level-normalised.
-   Silent windows are skipped.
+   Only windows with no sound at all (below about −66 dBFS) are skipped, so quiet
+   meeting-room recordings are still transcribed.
 3. Each window goes to two workers in parallel: **Whisper** (30 s chunks with 5 s
    overlap, timestamps, 5-gram repetition suppression) on the GPU when WebGPU is
    available, and **pyannote segmentation** (10 s chunks) on the CPU, which finds
