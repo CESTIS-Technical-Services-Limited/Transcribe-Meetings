@@ -163,9 +163,26 @@ suites.decoders = async (browser) => {
     const q = new Float32Array(16000 * 4); for (let i = 0; i < q.length; i++) q[i] = (i > 16000 * 1.5 && i < 16000 * 2.5) ? 0 : 0.3 * Math.sin(i);
     out.cut = __vs.quietestCut(q, 16000, q.length) / 16000;
     // conditionWindow normalises quiet audio but not silence
+    const rmsFrom = (x, from) => { let e = 0; for (let i = from; i < x.length; i++) e += x[i] * x[i]; return Math.sqrt(e / (x.length - from)); };
     const quiet = new Float32Array(16000); for (let i = 0; i < quiet.length; i++) quiet[i] = 0.05 * Math.sin(2 * Math.PI * 300 * i / 16000);
-    __vs.conditionWindow(quiet); let qp = 0; for (let i = 2000; i < quiet.length; i++) qp = Math.max(qp, Math.abs(quiet[i]));
-    out.normPeak = qp;
+    __vs.conditionWindow(quiet); out.normRms = rmsFrom(quiet, 2000);
+    // a distant talker: -45 dBFS speech for 6 s inside a 2-minute window of silence
+    const far = new Float32Array(16000 * 120);
+    for (let i = 16000 * 50; i < 16000 * 56; i++) far[i] = 0.0056 * Math.sin(2 * Math.PI * 220 * i / 16000) * (0.6 + 0.4 * Math.sin(2 * Math.PI * 3 * i / 16000));
+    out.farSilentBefore = __vs.isSilent(far);
+    __vs.conditionWindow(far); out.farSilent = __vs.isSilent(far);
+    let fp = 0; for (let i = 0; i < far.length; i++) fp = Math.max(fp, Math.abs(far[i])); out.farPeak = fp;
+    // digital silence and dither-level noise stay silent and untouched
+    const zero = new Float32Array(16000 * 10); __vs.conditionWindow(zero); out.zeroSilent = __vs.isSilent(zero);
+    const dither = new Float32Array(16000 * 10); for (let i = 0; i < dither.length; i++) dither[i] = (Math.random() - 0.5) * 6e-5;
+    __vs.conditionWindow(dither); out.ditherSilent = __vs.isSilent(dither);
+    let dp = 0; for (let i = 0; i < dither.length; i++) dp = Math.max(dp, Math.abs(dither[i])); out.ditherPeak = dp;
+    // one loud click must not stop quiet speech being boosted, and nothing clips
+    const click = new Float32Array(16000 * 10);
+    for (let i = 0; i < click.length; i++) click[i] = 0.01 * Math.sin(2 * Math.PI * 300 * i / 16000);
+    for (let i = 80000; i < 80040; i++) click[i] = 0.99;
+    __vs.conditionWindow(click); out.clickRms = rmsFrom(click, 2000);
+    let cp = 0; for (let i = 0; i < click.length; i++) cp = Math.max(cp, Math.abs(click[i])); out.clickPeak = cp;
     // assignSpeakers majority overlap + nearest fallback
     const segs = [{ start: 0, end: 4, text: 'a b c d' }, { start: 4.5, end: 9, text: 'e f' }, { start: 20, end: 21, text: 'g' }, { start: 22, end: 23, text: 'h i j k' }, { start: 30, end: 31, text: 'far' }];
     __vs.assignSpeakers(segs, [{ start: 0, end: 5, spk: 0 }, { start: 5, end: 10, spk: 1 }, { start: 19, end: 20.9, spk: 1 }, { start: 22, end: 23, spk: 0 }]);
@@ -179,7 +196,13 @@ suites.decoders = async (browser) => {
   check('resampler rejects >Nyquist (aliasing)', pf.aliasPeak < 0.05, pf.aliasPeak);
   check('resampler upsamples 8k→16k', pf.upLen === 16000, pf.upLen);
   check('quietestCut finds the gap', pf.cut > 1.5 && pf.cut < 2.5, pf.cut);
-  check('conditionWindow normalises level', pf.normPeak > 0.5 && pf.normPeak <= 0.95, pf.normPeak);
+  check('conditionWindow normalises level', close(pf.normRms, 0.25, 0.02), pf.normRms);
+  check('quiet distant speech is not treated as silence', !pf.farSilentBefore && !pf.farSilent, pf.farSilentBefore + '/' + pf.farSilent);
+  check('quiet distant speech is boosted', pf.farPeak > 0.2 && pf.farPeak <= 1, pf.farPeak);
+  check('digital silence is skipped', pf.zeroSilent);
+  check('dither noise is skipped and not amplified', pf.ditherSilent && pf.ditherPeak < 1e-4, pf.ditherSilent + ' ' + pf.ditherPeak);
+  check('a click does not block the boost', pf.clickRms > 0.1, pf.clickRms);
+  check('limiter keeps samples in range', pf.clickPeak <= 1, pf.clickPeak);
   check('assignSpeakers', JSON.stringify(pf.spk) === JSON.stringify([0, 1, 1, 0, null]), JSON.stringify(pf.spk));
   check('splitTranscriptText keeps lines whole', pf.split === 3, pf.split);
   check('no page errors', errors.length === 0, errors.join(' | '));
@@ -332,6 +355,44 @@ suites.graceful = async (browser) => {
     try { await e.ensureLoaded('onnx-community/whisper-tiny'); return 'loaded'; } catch (err) { return err.message; }
   });
   check('blocked CDN gives a friendly engine error', /Could not download the AI engine/.test(load), load);
+  // GPU trouble (garbage output or an exception) switches the engine to the CPU and redoes the window
+  const fb = await page.evaluate(async () => {
+    const E = __vs.engine.constructor;
+    const run = async (mode) => {
+      const e = new E('gpu-' + mode), loads = [], calls = [];
+      e.worker = { postMessage() {}, terminate() {} };
+      e._request = async (msg) => {
+        if (msg.type === 'load') { loads.push(msg.forceDevice || 'auto'); return { device: msg.forceDevice === 'wasm' ? 'wasm' : 'webgpu' }; }
+        calls.push({ device: e.device, n: msg.audio.length, detect: msg.detect });
+        if (e.device === 'webgpu') { if (mode === 'throw') throw new Error('GPUBuffer destroyed'); return { cues: [], suspect: true }; }
+        return { cues: [{ start: 0, end: 1, text: 'hello there' }], language: 'fr' };
+      };
+      await e.ensureLoaded('onnx-community/whisper-tiny');
+      const cues = await e.transcribe(new Float32Array(16000).fill(0.1), 0, null, 'transcribe');
+      const again = await e.ensureLoaded('onnx-community/whisper-tiny');
+      return { text: cues.map(c => c.text).join(' '), loads, calls, cpuOnly: e.cpuOnly, device: e.device, again, lang: e.lastLanguage };
+    };
+    const prev = __vs.state.gpu;
+    const out = { suspect: await run('suspect'), thrown: await run('throw') };
+    __vs.state.gpu = prev;
+    return out;
+  });
+  for (const k of ['suspect', 'thrown']) {
+    const r = fb[k];
+    check('GPU ' + k + ' output falls back to CPU', r.text === 'hello there' && r.cpuOnly && r.device === 'wasm' && r.again === 'wasm', JSON.stringify(r));
+    check('GPU ' + k + ': CPU reload forced and window re-sent intact', JSON.stringify(r.loads) === '["auto","wasm"]' && r.calls.length === 2 && r.calls[1].n === 16000 && r.calls[1].device === 'wasm', JSON.stringify(r));
+  }
+  check('auto language asks the engine to detect it', fb.suspect.calls[0].detect === true && fb.suspect.lang === 'fr', JSON.stringify(fb.suspect));
+  const cpuPref = await page.evaluate(async () => {
+    const E = __vs.engine.constructor; const e = new E('cpu-pref'); const loads = [];
+    e.worker = { postMessage() {}, terminate() {} };
+    e._request = async (msg) => { loads.push(msg.forceDevice || 'auto'); return { device: msg.forceDevice === 'wasm' ? 'wasm' : 'webgpu' }; };
+    __vs.state.settings.useGpu = false;
+    const d = await e.ensureLoaded('m');
+    __vs.state.settings.useGpu = true;
+    return { d, loads };
+  });
+  check('"Use GPU" off forces the CPU', cpuPref.d === 'wasm' && cpuPref.loads[0] === 'wasm', JSON.stringify(cpuPref));
   check('no page errors', errors.length === 0, errors.join(' | '));
   await ctx.close();
 };
