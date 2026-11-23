@@ -324,6 +324,25 @@ function friendlyLoadError(err, model) {
 }
 
 /* ── Whisper ─────────────────────────────────────────────────── */
+// Weight precision per device, best first. Aggressive quantisation is the
+// main source of misspelt / made-up words: a 4-bit decoder (the old GPU
+// default) and an 8-bit encoder (the old CPU default) both garble words,
+// worst on the smaller models. Each option is tried in turn, so a model
+// repo that lacks a variant still loads.
+let gpuF16 = false;
+function whisperDtypes(model, dev) {
+  const big = /large|turbo|medium/i.test(model);
+  if (dev === 'webgpu') {
+    const list = [];
+    if (gpuF16) list.push({ encoder_model: 'fp16', decoder_model_merged: 'fp16' });
+    list.push({ encoder_model: 'fp32', decoder_model_merged: 'fp32' });
+    if (gpuF16) list.push({ encoder_model: 'fp16', decoder_model_merged: 'q4' });
+    return list;
+  }
+  if (big) return [{ encoder_model: 'q8', decoder_model_merged: 'q8' }];
+  if (/tiny|base/i.test(model)) return [{ encoder_model: 'fp32', decoder_model_merged: 'fp32' }, { encoder_model: 'fp32', decoder_model_merged: 'q8' }, 'q8'];
+  return [{ encoder_model: 'fp32', decoder_model_merged: 'q8' }, 'q8'];
+}
 async function loadWhisper(msg) {
   const m = await loadTransformers(msg.cdnUrls);
   applyHost(m, msg.host);
@@ -332,7 +351,9 @@ async function loadWhisper(msg) {
     else {
       try {
         const nav = self.navigator || (typeof navigator !== 'undefined' ? navigator : null);
-        device = (nav && nav.gpu && await nav.gpu.requestAdapter()) ? 'webgpu' : 'wasm';
+        const adapter = nav && nav.gpu ? await nav.gpu.requestAdapter() : null;
+        device = adapter ? 'webgpu' : 'wasm';
+        gpuF16 = !!(adapter && adapter.features && adapter.features.has && adapter.features.has('shader-f16'));
       } catch (err) { device = 'wasm'; }
     }
   }
@@ -341,20 +362,24 @@ async function loadWhisper(msg) {
     if (pipe && pipe.dispose) { try { await pipe.dispose(); } catch (e) {} }
     pipe = null; loadedKey = '';
     const onProg = progressRelay('whisper');
+    const tryLoad = async (dev) => {
+      let lastErr = null;
+      for (const dtype of whisperDtypes(msg.model, dev)) {
+        try {
+          return await m.pipeline('automatic-speech-recognition', msg.model, { device: dev, dtype: dtype, progress_callback: onProg });
+        } catch (err) { lastErr = err; console.warn('Whisper load failed with dtype ' + JSON.stringify(dtype) + ', trying the next option.', err); }
+      }
+      throw lastErr;
+    };
     try {
-      const opts = device === 'webgpu'
-        ? { device: 'webgpu', dtype: { encoder_model: 'fp16', decoder_model_merged: 'q4' } }
-        : { device: 'wasm', dtype: 'q8' };
-      pipe = await m.pipeline('automatic-speech-recognition', msg.model, Object.assign({}, opts, { progress_callback: onProg }));
+      pipe = await tryLoad(device);
     } catch (err) {
       // Any GPU failure (no fp16 support, missing GPU weights, driver
       // trouble) falls back to the CPU build of the same model.
       if (device === 'webgpu') {
         console.warn('WebGPU model load failed, using the CPU instead.', err);
         device = 'wasm';
-        try {
-          pipe = await m.pipeline('automatic-speech-recognition', msg.model, { device: 'wasm', dtype: 'q8', progress_callback: onProg });
-        } catch (err2) { throw friendlyLoadError(err2, msg.model); }
+        try { pipe = await tryLoad('wasm'); } catch (err2) { throw friendlyLoadError(err2, msg.model); }
       } else { throw friendlyLoadError(err, msg.model); }
     }
     loadedKey = msg.model + '|' + device + '|' + activeHost;
@@ -362,6 +387,35 @@ async function loadWhisper(msg) {
   return device;
 }
 
+// Collapse Whisper repetition loops ("we can we can we can we can …"):
+// a word or phrase (up to 8 words) is kept at most twice in a row, so
+// natural repeats ("I don't know, I don't know") survive.
+function collapseRepeats(text) {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length < 3) return text;
+  const norm = words.map(w => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, ''));
+  const out = [], outN = [];
+  let i = 0;
+  while (i < words.length) {
+    let skipped = false;
+    for (let n = 1; n <= 8 && !skipped; n++) {
+      if (outN.length < n) break;
+      const keep = 2;
+      if (outN.length < n * keep) continue;
+      // Is the tail of the output already `keep` copies of this n-gram, and does the input continue it?
+      let tailOk = true;
+      for (let k = 0; k < keep && tailOk; k++)
+        for (let j = 0; j < n; j++)
+          if (outN[outN.length - n * (k + 1) + j] !== outN[outN.length - n + j] || !outN[outN.length - n + j]) { tailOk = false; break; }
+      if (!tailOk || i + n > words.length) continue;
+      let same = true;
+      for (let j = 0; j < n; j++) if (norm[i + j] !== outN[outN.length - n + j]) { same = false; break; }
+      if (same) { i += n; skipped = true; }
+    }
+    if (!skipped) { out.push(words[i]); outN.push(norm[i]); i++; }
+  }
+  return out.join(' ');
+}
 function isHallucinated(text) {
   if (!text || text.length < 24) return false;
   const words = text.trim().split(/\s+/);
@@ -387,33 +441,52 @@ function isBoilerplate(t) {
 }
 
 // Whisper's own language identification: one decoder step after
-// <|startoftranscript|> on the loudest 30 s, scored over the language
-// tokens. (transformers.js does not do this itself — without a language
-// it silently assumes English.)
+// <|startoftranscript|>, scored over the language tokens. Up to three of
+// the loudest non-overlapping 30 s stretches are scored and their
+// probabilities summed, so one noisy or speech-free stretch cannot lock
+// the whole recording into the wrong language (which turns every word
+// into gibberish). (transformers.js does not do this itself — without a
+// language it silently assumes English.)
 async function detectLanguage(audio) {
   const model = pipe.model, gc = (model && model.generation_config) || {};
   const langs = gc.lang_to_id;
   if (!gc.is_multilingual || !langs || !pipe.processor || !mod.Tensor) return null;
-  const N = 30 * SR;
-  let start = 0;
-  if (audio.length > N) {
-    const B = SR, nb = Math.floor(audio.length / B), e = new Float64Array(nb);
+  const N = 30 * SR, B = SR;
+  const starts = [];
+  if (audio.length <= N) starts.push(0);
+  else {
+    const nb = Math.floor(audio.length / B), e = new Float64Array(nb);
     for (let b = 0; b < nb; b++) { let s = 0; for (let j = b * B; j < (b + 1) * B; j += 4) s += audio[j] * audio[j]; e[b] = s; }
-    const w = Math.min(30, nb); let sum = 0, best = -1;
+    const w = Math.min(30, nb), win = [];
+    let sum = 0;
     for (let b = 0; b < nb; b++) {
       sum += e[b]; if (b >= w) sum -= e[b - w];
-      if (b >= w - 1 && sum > best) { best = sum; start = (b - w + 1) * B; }
+      if (b >= w - 1) win.push({ b: b - w + 1, e: sum });
+    }
+    win.sort((x, y) => y.e - x.e);
+    for (const c of win) {
+      if (starts.length >= 3) break;
+      if (starts.every(st => Math.abs(st - c.b * B) >= N)) starts.push(c.b * B);
     }
   }
-  const inputs = await pipe.processor(audio.subarray(start, Math.min(audio.length, start + N)));
   const sot = gc.decoder_start_token_id;
-  const out = await model({ input_features: inputs.input_features, decoder_input_ids: new mod.Tensor('int64', BigInt64Array.from([BigInt(sot)]), [1, 1]) });
-  let logits = out.logits;
-  if (logits.type !== 'float32') { if (!logits.to) return null; logits = logits.to('float32'); }
-  const V = logits.dims[logits.dims.length - 1], base = logits.data.length - V;
-  let code = null, bv = -Infinity;
-  for (const tok in langs) { const v = Number(logits.data[base + langs[tok]]); if (v > bv) { bv = v; code = tok; } }
-  for (const k in out) { if (k !== 'logits' && out[k] && typeof out[k].dispose === 'function') { try { out[k].dispose(); } catch (e) {} } }
+  const keys = Object.keys(langs), score = new Float64Array(keys.length);
+  for (const start of starts) {
+    const inputs = await pipe.processor(audio.subarray(start, Math.min(audio.length, start + N)));
+    const out = await model({ input_features: inputs.input_features, decoder_input_ids: new mod.Tensor('int64', BigInt64Array.from([BigInt(sot)]), [1, 1]) });
+    let logits = out.logits;
+    if (logits.type !== 'float32') logits = logits.to ? logits.to('float32') : null;
+    if (logits) {
+      const V = logits.dims[logits.dims.length - 1], base = logits.data.length - V;
+      let mx = -Infinity;
+      const v = keys.map(k => { const x = Number(logits.data[base + langs[k]]); if (x > mx) mx = x; return x; });
+      let z = 0; for (const x of v) z += Math.exp(x - mx);
+      for (let i = 0; i < v.length; i++) { const pr = Math.exp(v[i] - mx) / z; if (isFinite(pr)) score[i] += pr; }
+    }
+    for (const k in out) { if (out[k] && typeof out[k].dispose === 'function') { try { out[k].dispose(); } catch (e) {} } }
+  }
+  let code = null, bv = 0;
+  for (let i = 0; i < keys.length; i++) if (score[i] > bv) { bv = score[i]; code = keys[i]; }
   return code ? code.replace(/^<\|/, '').replace(/\|>$/, '') : null;
 }
 // Non-speech markers Whisper writes into otherwise good text.
@@ -427,7 +500,10 @@ async function transcribe(msg) {
     chunk_length_s: 30,
     stride_length_s: 5,
     return_timestamps: true,
-    no_repeat_ngram_size: 5,
+    // No no_repeat_ngram_size: it bans any repeated run of sub-word tokens,
+    // so ordinary repeated phrases ("I don't know, I don't know") force
+    // Whisper onto odd spellings and invented words. Repetition loops are
+    // collapsed after decoding instead (collapseRepeats).
   };
   let language = msg.language || null, detected = null;
   if (multilingual) {
@@ -446,7 +522,7 @@ async function transcribe(msg) {
   const suspect = allText.length >= 3 && /^[\p{P}\p{S}]+$/u.test(allText);
   const cues = []; let prev = '';
   for (const c of raw) {
-    const t = (c.text || '').replace(INLINE_TAGS, ' ').trim();
+    const t = collapseRepeats((c.text || '').replace(INLINE_TAGS, ' ').trim());
     if (!t) continue;
     if (isHallucinated(t) || isBoilerplate(t)) continue;
     if (t === prev && t.length > 8) continue;
@@ -656,7 +732,7 @@ self.onmessage = async function (e) {
     self.postMessage({ type: 'error', id: msg && msg.id, message: (err && err.message) || String(err) });
   }
 };
-self.__internals = { clusterItems, finalizeSpeakers, D, isHallucinated, isBoilerplate, mp3: null };
+self.__internals = { clusterItems, finalizeSpeakers, D, isHallucinated, isBoilerplate, collapseRepeats, whisperDtypes, mp3: null };
 self.postMessage({ type: 'boot' });
 </script>
 <script>
