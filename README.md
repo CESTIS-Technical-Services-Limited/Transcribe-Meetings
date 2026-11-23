@@ -36,12 +36,14 @@ your computer.
   - audio conditioning: band-limited 16 kHz resampling, 80 Hz high-pass, level normalisation that
     boosts quiet or distant recordings by up to +36 dB
   - silence-aware windowing so long recordings are cut between words
-  - repetition suppression plus hallucination/boilerplate filtering
+  - full-precision weights where it matters (fp16 on GPUs that support it, fp32
+    encoder on the CPU) — heavy 4-bit/8-bit quantisation garbles words
+  - repetition-loop collapsing plus hallucination/boilerplate filtering
   - any ONNX Whisper model from the Hugging Face Hub (English-only, distilled or
     domain fine-tuned variants) via Settings → Advanced, and a configurable model
     mirror for locked-down networks
 - **99 languages** with real auto-detection (Whisper's own language ID on the
-  loudest 30 s; the detected language is shown on the transcript), plus "translate to English" mode.
+  up to three of the loudest 30 s stretches; the detected language is shown on the transcript), plus "translate to English" mode.
 - **Transcript workspace** — timestamped segments, click a timestamp to jump the
   audio player, follow-along highlighting, playback speed, keyboard shortcuts
   (Ctrl+Enter play/pause, Ctrl+Shift+←/→ seek, Ctrl+Shift+↑ play from the line
@@ -113,7 +115,7 @@ in a secure context).
    Only windows with no sound at all (below about −66 dBFS) are skipped, so quiet
    meeting-room recordings are still transcribed.
 3. Each window goes to two workers in parallel: **Whisper** (30 s chunks with 5 s
-   overlap, timestamps, 5-gram repetition suppression) on the GPU when WebGPU is
+   overlap, timestamps, repetition loops collapsed after decoding) on the GPU when WebGPU is
    available, and **pyannote segmentation** (10 s chunks) on the CPU, which finds
    who is speaking when; a **WeSpeaker** embedding is computed for every local
    speaker.

@@ -539,6 +539,8 @@ suites.speakers = async (browser) => {
     out.notHallu = W.isHallucinated('This is a perfectly normal sentence with varied words in it, thank you very much.');
     out.boiler = ['Thanks for watching!', 'Subtitles by the Amara.org community', 'you', '...', '♪♪'].map(W.isBoilerplate);
     out.notBoiler = ['Thank you, that helps.', 'You should see this.'].map(W.isBoilerplate);
+    out.collapse = ['we can we can we can we can go', "I don't know, I don't know.", 'no no no no', 'the cat sat'].map(W.collapseRepeats);
+    out.dtypes = { tinyCpu: W.whisperDtypes('onnx-community/whisper-tiny', 'wasm')[0], gpu: W.whisperDtypes('onnx-community/whisper-small', 'webgpu') };
     return out;
   });
   check('auto clustering finds 3 speakers', r.autoCount === 3, r.autoCount);
@@ -549,6 +551,8 @@ suites.speakers = async (browser) => {
   check('single speaker cap', r.oneCount === 1 && r.oneAllSame);
   check('no embeddings handled', r.noneOk);
   check('hallucination loop detected', r.hallu === true && r.notHallu === false);
+  check('repetition loops collapsed, natural repeats kept', JSON.stringify(r.collapse) === JSON.stringify(['we can we can go', "I don't know, I don't know.", 'no no', 'the cat sat']), JSON.stringify(r.collapse));
+  check('no 4-bit or 8-bit-encoder weights by default', r.dtypes.tinyCpu.encoder_model === 'fp32' && r.dtypes.gpu.every(d => d.decoder_model_merged !== 'q4' || d !== r.dtypes.gpu[0]), JSON.stringify(r.dtypes));
   check('boilerplate filtered', r.boiler.every(Boolean) && r.notBoiler.every(x => !x), JSON.stringify([r.boiler, r.notBoiler]));
   check('no page errors', errors.length === 0, errors.join(' | '));
   await ctx.close();
